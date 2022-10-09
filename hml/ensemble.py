@@ -23,37 +23,180 @@ class CustomLGBMClassifier(LGBMClassifier):
     def apply(self, X):
         return self.predict(X, pred_leaf = True)
     
+    def decision_path(self, X, decision_weight = None):
+        leafs = self.apply(X)
+        return self._transform_decision_path(leafs)
+    
     def fit(self, X, y = None, sample_weight = None, **kwargs):
         super().fit(X, y=y, sample_weight=sample_weight, **kwargs)
         model_df = self.booster_.trees_to_dataframe()
         node_weights = model_df[model_df["decision_type"].isna()]["weight"].values
+        
+        leafs = self.predict(X, pred_leaf = True)
+        leaf_encoder = OneHotEncoder().fit(leafs)
+        self.leaf_encoder_ = leaf_encoder
+        self._fit_decision_path(leafs, model_df, decision_weight = "unit_parent_gain")
         self.node_weights_ = node_weights
+        
         return self
+    
+    def _fit_decision_path(self, leafs, model_df, decision_weight = None):
+
+        d_cols = ["split_gain","parent_index","node_index","count"]
+        parent_split_gain = pd.merge(model_df[d_cols], model_df[d_cols], left_on = "parent_index", right_on = "node_index", how = "left")
+
+        model_df["parent_gain"] = parent_split_gain["split_gain_y"]
+        model_df["parent_count"] = parent_split_gain["count_y"]
+        model_df["unit_parent_gain"] = model_df["parent_gain"]/model_df["count"]
+        model_df["unit_gain"] = model_df["split_gain"]/model_df["count"]
+        model_df["inverse_count"] = 1/model_df["count"]
+
+        model_df["int_index"] = model_df["node_index"].str.split("-").str[1].str[1:].astype(int)
+        model_df["leaf_index"] = np.where(model_df["right_child"].isna(), model_df["int_index"], np.nan)
+
+        leaf_indexes = model_df.dropna(subset = ["leaf_index"]).sort_values(by = ["tree_index", "int_index"]).index.values
+
+        g = nx.DiGraph()
+        g.add_nodes_from(model_df["node_index"])
+        if not decision_weight is None:
+            z = list(tuple(i) for i in tuple(model_df[["parent_index","node_index",decision_weight]].dropna().values))
+            g.add_weighted_edges_from(z)
+        else:
+            z = list(tuple(i) for i in tuple(model_df[["parent_index","node_index"]].dropna().values))
+            g.add_edges_from(z)
+
+        node_decision_paths = nx.adjacency_matrix(g)
+        paths = self._transform_decision_path(leafs)        
+        self._leaf_decision_paths = paths
+        return 
+
+    def _transform_decision_path(self, leafs):
+        encoded_leafs = self.leaf_encoder_.transform(leafs)
+        terminal_nodes = np.array(np.split(encoded_leafs.nonzero()[1], leafs.shape[0]))
+        paths = node_decision_paths[terminal_nodes.flatten()]
+        paths = paths.reshape(leafs.shape[0], paths.shape[0]//leafs.shape[0]*paths.shape[1]).tocsr()
+
+        return paths
     
 class CustomLGBMRegressor(LGBMRegressor):
     
     def apply(self, X):
         return self.predict(X, pred_leaf = True)
     
+    def decision_path(self, X, decision_weight = None):
+        leafs = self.apply(X)
+        return self._transform_decision_path(leafs)
+    
     def fit(self, X, y = None, sample_weight = None, **kwargs):
         super().fit(X, y=y, sample_weight=sample_weight, **kwargs)
         model_df = self.booster_.trees_to_dataframe()
         node_weights = model_df[model_df["decision_type"].isna()]["weight"].values
+        
+        leafs = self.predict(X, pred_leaf = True)
+        leaf_encoder = OneHotEncoder().fit(leafs)
+        self.leaf_encoder_ = leaf_encoder
+        self._fit_decision_path(leafs, model_df, decision_weight = "unit_parent_gain")
         self.node_weights_ = node_weights
+        
         return self
+    
+    def _fit_decision_path(self, leafs, model_df, decision_weight = None):
 
+        d_cols = ["split_gain","parent_index","node_index","count"]
+        parent_split_gain = pd.merge(model_df[d_cols], model_df[d_cols], left_on = "parent_index", right_on = "node_index", how = "left")
+
+        model_df["parent_gain"] = parent_split_gain["split_gain_y"]
+        model_df["parent_count"] = parent_split_gain["count_y"]
+        model_df["unit_parent_gain"] = model_df["parent_gain"]/model_df["count"]
+        model_df["unit_gain"] = model_df["split_gain"]/model_df["count"]
+        model_df["inverse_count"] = 1/model_df["count"]
+
+        model_df["int_index"] = model_df["node_index"].str.split("-").str[1].str[1:].astype(int)
+        model_df["leaf_index"] = np.where(model_df["right_child"].isna(), model_df["int_index"], np.nan)
+
+        leaf_indexes = model_df.dropna(subset = ["leaf_index"]).sort_values(by = ["tree_index", "int_index"]).index.values
+
+        g = nx.DiGraph()
+        g.add_nodes_from(model_df["node_index"])
+        if not decision_weight is None:
+            z = list(tuple(i) for i in tuple(model_df[["parent_index","node_index",decision_weight]].dropna().values))
+            g.add_weighted_edges_from(z)
+        else:
+            z = list(tuple(i) for i in tuple(model_df[["parent_index","node_index"]].dropna().values))
+            g.add_edges_from(z)
+
+        node_decision_paths = nx.adjacency_matrix(g)
+        paths = self._transform_decision_path(leafs)        
+        self._leaf_decision_paths = paths
+        return 
+
+    def _transform_decision_path(self, leafs):
+        encoded_leafs = self.leaf_encoder_.transform(leafs)
+        terminal_nodes = np.array(np.split(encoded_leafs.nonzero()[1], leafs.shape[0]))
+        paths = node_decision_paths[terminal_nodes.flatten()]
+        paths = paths.reshape(leafs.shape[0], paths.shape[0]//leafs.shape[0]*paths.shape[1]).tocsr()
+
+        return paths
+    
 class CustomLGBMRanker(LGBMRanker):
     
     def apply(self, X):
         return self.predict(X, pred_leaf = True)
     
+    def decision_path(self, X, decision_weight = None):
+        leafs = self.apply(X)
+        return self._transform_decision_path(leafs)
+    
     def fit(self, X, y = None, sample_weight = None, **kwargs):
         super().fit(X, y=y, sample_weight=sample_weight, **kwargs)
         model_df = self.booster_.trees_to_dataframe()
         node_weights = model_df[model_df["decision_type"].isna()]["weight"].values
+        
+        leafs = self.predict(X, pred_leaf = True)
+        leaf_encoder = OneHotEncoder().fit(leafs)
+        self.leaf_encoder_ = leaf_encoder
+        self._fit_decision_path(leafs, model_df, decision_weight = "unit_parent_gain")
         self.node_weights_ = node_weights
+        
         return self
+    
+    def _fit_decision_path(self, leafs, model_df, decision_weight = None):
 
+        d_cols = ["split_gain","parent_index","node_index","count"]
+        parent_split_gain = pd.merge(model_df[d_cols], model_df[d_cols], left_on = "parent_index", right_on = "node_index", how = "left")
+
+        model_df["parent_gain"] = parent_split_gain["split_gain_y"]
+        model_df["parent_count"] = parent_split_gain["count_y"]
+        model_df["unit_parent_gain"] = model_df["parent_gain"]/model_df["count"]
+        model_df["unit_gain"] = model_df["split_gain"]/model_df["count"]
+        model_df["inverse_count"] = 1/model_df["count"]
+
+        model_df["int_index"] = model_df["node_index"].str.split("-").str[1].str[1:].astype(int)
+        model_df["leaf_index"] = np.where(model_df["right_child"].isna(), model_df["int_index"], np.nan)
+
+        leaf_indexes = model_df.dropna(subset = ["leaf_index"]).sort_values(by = ["tree_index", "int_index"]).index.values
+
+        g = nx.DiGraph()
+        g.add_nodes_from(model_df["node_index"])
+        if not decision_weight is None:
+            z = list(tuple(i) for i in tuple(model_df[["parent_index","node_index",decision_weight]].dropna().values))
+            g.add_weighted_edges_from(z)
+        else:
+            z = list(tuple(i) for i in tuple(model_df[["parent_index","node_index"]].dropna().values))
+            g.add_edges_from(z)
+
+        node_decision_paths = nx.adjacency_matrix(g)
+        paths = self._transform_decision_path(leafs)        
+        self._leaf_decision_paths = paths
+        return 
+
+    def _transform_decision_path(self, leafs):
+        encoded_leafs = self.leaf_encoder_.transform(leafs)
+        terminal_nodes = np.array(np.split(encoded_leafs.nonzero()[1], leafs.shape[0]))
+        paths = node_decision_paths[terminal_nodes.flatten()]
+        paths = paths.reshape(leafs.shape[0], paths.shape[0]//leafs.shape[0]*paths.shape[1]).tocsr()
+
+        return paths
 
 class ForestNeighbors(BaseEstimator):
     
@@ -264,7 +407,7 @@ def _postprocess_node_points(points, n_neighbors, sample_size):
     return dist, idx
 
 
-class LeafEmbedder(BaseEstimator):
+class ArchetypeEmbedder(BaseEstimator):
     #fit models and graph embeddings on terminal node space
     #save louvain terminal node embeddings for inference
     #transform method will yield louvain embeddings of the point
@@ -275,6 +418,7 @@ class LeafEmbedder(BaseEstimator):
         forest_estimator,
         embedding_method = 'louvain',        
         alpha = 1.0,
+        use_leaf_weights = False,
         return_embeddings_as_sparse = True,
         ensemble_node_weights_attr = None,
         **embedding_kws        
@@ -313,7 +457,7 @@ class LeafEmbedder(BaseEstimator):
         
         Returns
         -------
-        LeafEmbedder object
+        ArchetypeEmbedder object
         
         '''
         self.forest_estimator = forest_estimator
@@ -322,6 +466,7 @@ class LeafEmbedder(BaseEstimator):
         self.alpha = alpha
         self.embedding_kws = embedding_kws
         self.ensemble_node_weights_attr = ensemble_node_weights_attr
+        self.use_leaf_weights = use_leaf_weights
         return
     
     def __getattr__(self, attr):
@@ -329,6 +474,7 @@ class LeafEmbedder(BaseEstimator):
         returns self.forest_estimator attribute if not found in class definition
         '''
         return getattr(self.forest_estimator, attr)
+    
     
     def fit(self, X, y = None, **kwargs):
         '''
@@ -349,13 +495,13 @@ class LeafEmbedder(BaseEstimator):
         Returns
         -------
         
-        LeafEmbedder fitted object
+        ArchetypeEmbedder fitted object
         
         '''
         #fit estimator
         self.forest_estimator.fit(X = X, y = y, **kwargs)
         # gets terminal nodes
-        terminal_nodes = self.apply(X)        
+        terminal_nodes = self.apply(X)
         #fit one hot encoders of the nodes        
         self.one_hot_node_embeddings_encoders_ = OneHotEncoder().fit(terminal_nodes)
         #fits emedder
@@ -372,20 +518,19 @@ class LeafEmbedder(BaseEstimator):
             X = X.reshape(X.shape[0], X.shape[1]*X.shape[2])
         return X
     
-    def node_biadjecency_matrix(self, X, node_weights = None):
+    def node_biadjecency_matrix(self, X):
         
         terminal_nodes = self.apply(X)        
         #gets biadjecency matrix
         biadjecency_matrix = self.one_hot_node_embeddings_encoders_.transform(terminal_nodes)
         biadjecency_matrix = sparse.csr_matrix(biadjecency_matrix)
         
-        if not node_weights is None:
-            if len(node_weights.shape) > 1:
-                raise ValueError(f"node_weights should be a 1d vector, got array of shape {node_weights.shape}")
-            biadjecency_matrix = biadjecency_matrix.multiply(node_weights.reshape(1,-1))
-        else:
-            pass
-        
+        if self.use_leaf_weights:
+            if hasattr(self.forest_estimator, "leaf_weights_"):
+                biadjecency_matrix = biadjecency_matrix.multiply(self.forest_estimator.leaf_weights_)
+            else:
+                raise AttributeError("forest_estimator should contain leaf_weights_ attribute error in order to properly use use_leaf_weights"):
+                
         return biadjecency_matrix
     
     def fit_embeddings(self, X, embedding_method = None, **kwargs):
@@ -496,7 +641,7 @@ class LeafEmbedder(BaseEstimator):
     
 
     
-class MixedForestEmbedder(LeafEmbedder):
+class MixedForestArchetypeEmbedder(ArchetypeEmbedder):
     
     def __init__(
         self,
@@ -560,7 +705,7 @@ class MixedForestEmbedder(LeafEmbedder):
         
         Returns
         -------
-        MixedForestEmbedder object
+        MixedForestArchetypeEmbedder object
         
         '''
         self.estimators = estimators        
@@ -662,7 +807,7 @@ class MixedForestEmbedder(LeafEmbedder):
 
     
 #export   
-class HeterogeneousMixedForest(MixedForestEmbedder):
+class HeterogeneousMixedForest(MixedForestArchetypeEmbedder):
     
     def fit(self, X, y = None, sample_weight = None):                        
                     
@@ -695,7 +840,7 @@ class HeterogeneousMixedForest(MixedForestEmbedder):
 
     
 #export
-class MixedForestRegressor(MixedForestEmbedder):
+class MixedForestRegressor(MixedForestArchetypeEmbedder):
     
     def fit(self, X, y = None, sample_weight = None):
                 
@@ -866,3 +1011,9 @@ class MixedForestClassifier(MixedForestEmbedder):
             result = reduce(sum_f, range(len(result)))
         
         return result                                            
+    
+class LeafEmbedder(ArchetypeEmbedder):
+    """
+    uses archetype embeddings to reduce dimensionality using the comunity aggregated network to anchor points in a N dimensional space
+    """
+    pass
