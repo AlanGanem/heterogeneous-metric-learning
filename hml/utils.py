@@ -145,8 +145,23 @@ def sparse_dot_product(
     '''
 
     MAX_BYTES = 100e6 #process dense arrays of maximum 100MB for dense numpy dot product
+    if n_jobs is None:
+        n_jobs = 1
+        
+    if not sparse.issparse(A):
+        A = sparse.csr_matrix(A)
+    
+    if not sparse.issparse(B):
+        
+        B = sparse.csr_matrix(B)
 
     if 'awesome_cossim_topn' in globals():
+        if ntop is None:
+            ntop = B.shape[-1]            
+        
+        B = B.astype(np.float32)
+        A = A.astype(np.float32)
+        
         dot = awesome_cossim_topn(
             A = A,
             B = B,
