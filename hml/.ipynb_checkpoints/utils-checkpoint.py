@@ -107,7 +107,7 @@ def cosine_distance(A, B, topn = 30, remove_diagonal = False, **kwargs):
 def sparse_dot_product(
     A,
     B,
-    ntop = 1,
+    ntop = None,
     lower_bound=0,
     use_threads=False,
     n_jobs=1,
@@ -145,8 +145,23 @@ def sparse_dot_product(
     '''
 
     MAX_BYTES = 100e6 #process dense arrays of maximum 100MB for dense numpy dot product
+    if n_jobs is None:
+        n_jobs = 1
+        
+    if not sparse.issparse(A):
+        A = sparse.csr_matrix(A)
+    
+    if not sparse.issparse(B):
+        
+        B = sparse.csr_matrix(B)
 
     if 'awesome_cossim_topn' in globals():
+        if ntop is None:
+            ntop = B.shape[-1]            
+        
+        B = B.astype(np.float32)
+        A = A.astype(np.float32)
+        
         dot = awesome_cossim_topn(
             A = A,
             B = B,
@@ -213,24 +228,38 @@ def stack(blocks, **kwargs):
     return _robust_stack(blocks, stack_method = 'stack', **kwargs)
 
 
-class RobustEncoder(BaseEstimator, TransformerMixin):
-
-    def __init__(self,):
-        '''
-        A robust one hot encoder. Always return the same amount of nonzero value sin each transformed row.
-        Has columns for unknown values
-        '''
+#prefir estimator
+class PrefitEstimator(BaseEstimator):
+    
+    def __init__(self, prefit_estimator):
+        self.prefit_estimator = prefit_estimator
+        self.is_fitted_ = True
         return
-
-    def fit(self, X, y = None, **kwawrgs):
-        self.ordinalencoder_ = OrdinalEncoder(handle_unknown = 'use_encoded_value', unknown_value = -1).fit(X)
-
-        X = self.ordinalencoder_.transform(X)
-
-        categories = [np.arange(-1, len(cats)) for cats in self.ordinalencoder_.categories_]
-        self.onehotencoder_ = OneHotEncoder(categories = categories).fit(X)
-        return self
-
-    def transform(self, X, **kwargs):
-        X = self.ordinalencoder_.transform(X)
-        return self.onehotencoder_.transform(X)
+    
+    def __getattr__(self, attr):
+        '''
+        gets the attributes from prefit_estimator, except if the attribute (or method)
+        is "fit".
+        
+        if the "transform" or "predict" method is called, it'll return self.prefit_estimator's method
+        '''
+        if attr == 'fit':
+            return self.fit        
+        elif attr == 'fit_transform':
+            return self.fit_transform
+        elif attr == 'fit_predict':
+            return self.fit_predict            
+        else:
+            return getattr(self.prefit_estimator, attr)
+    
+    def fit(self, X, y = None, **kwargs):
+        '''
+        the fit method does nothing (since prefit_estimator is already fitted) and returns self.
+        '''
+        return self    
+    
+    def fit_transform(self, X, y = None, **kwargs):
+        return self.transform(X) #will get "transform" method from self.prefit_estimator
+    
+    def fit_predict(self, X, y = None, **kwargs):
+        return self.predict(X) #will get "predict" method from self.prefit_estimator

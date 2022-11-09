@@ -1,8 +1,11 @@
 import numpy as np
 
-from sklearn.preprocessing import KBinsDiscretizer
+from sklearn.preprocessing import KBinsDiscretizer, OneHotEncoder, OrdinalEncoder
 from sklearn.cluster import KMeans
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.utils.validation import check_is_fitted
+
+import warnings
 
 class RobustKBinsDiscretizer(KBinsDiscretizer):
     

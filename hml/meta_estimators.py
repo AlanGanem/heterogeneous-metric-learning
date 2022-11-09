@@ -9,6 +9,7 @@ from functools import reduce
 
 from scipy import sparse
 
+from .utils import _parse_pipeline_fit_kws, _parse_pipeline_fit_sample_weight
 
 def _log_odds_ratio_scale(X):
     X = np.clip(X, 1e-8, 1 - 1e-8)   # numerical stability
@@ -268,8 +269,9 @@ class ArchetypeEnsembleClassifier(BaseEstimator):
             else:
                 if not weights is None:
                     if isinstance(estim, Pipeline):
-                        last_estim_name = list(estim.named_steps)[-1]
-                        estim.fit(X=X_sample, y=y_sample, **{f"{last_estim_name}__sample_weight":weights})
+                        kwargs = _parse_pipeline_fit_kws(estim, **kwargs)
+                        sample_weights = _parse_pipeline_fit_sample_weight(estim, sample_weight)                
+                        estim.fit(X=X_sample, y=y_sample, **{**kwargs, **sample_weights})                        
                     else:
                         estim.fit(X=X_sample, y=y_sample, sample_weight=weights)
                 else:
@@ -421,8 +423,9 @@ class ArchetypeEnsembleRegressor(BaseEstimator):
             
             if not weights is None:
                 if isinstance(estim, Pipeline):
-                    last_estim_name = list(estim.named_steps)[-1]
-                    estim.fit(X=X_sample, y=y_sample, **{f"{last_estim_name}__sample_weight":weights})
+                    kwargs = _parse_pipeline_fit_kws(estim, **kwargs)
+                    sample_weights = _parse_pipeline_fit_sample_weight(estim, sample_weight)                
+                    estim.fit(X=X_sample, y=y_sample, **{**kwargs, **sample_weights})                        
                 else:
                     estim.fit(X=X_sample, y=y_sample, sample_weight=weights)
             else:

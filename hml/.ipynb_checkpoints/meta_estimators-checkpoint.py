@@ -1,5 +1,6 @@
-from sklearn.base import BaseEstimator, ClassifierMixin,clone
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, clone
 from sklearn.utils.validation import check_array
+from sklearn.pipeline import Pipeline
 from scipy.special import softmax
 import numpy as np
 
@@ -8,6 +9,7 @@ from functools import reduce
 
 from scipy import sparse
 
+from .utils import _parse_pipeline_fit_kws, _parse_pipeline_fit_sample_weight
 
 def _log_odds_ratio_scale(X):
     X = np.clip(X, 1e-8, 1 - 1e-8)   # numerical stability
@@ -186,13 +188,35 @@ class ResidualClassifier(ResidualRegressor):
         
 
 
-class ArchetypeEstimator(BaseEstimator):
+class _SingleLabelClassifier(BaseEstimator):
+    def __init__(self,):
+        """
+        a helper estimator to handle cases where there is only one target
+        """
+        return
+    
+    def fit(self, X, y = None, sample_weight = None, **kwargs):
+        classes = np.unique(y)
+        if len(classes) > 1:
+            raise ValueError(f"y should contain only one value, found values: {classes}")
+        
+        self.classes_ = classes
+        return self
+    
+    def predict(self, X):
+        return np.array(X.shape[0]*[self.classes_[0]])
+    
+    def predict_proba(self, X):
+        return np.ones((X.shape[0], 1))
+
+class ArchetypeEnsembleClassifier(BaseEstimator):
     def __init__(
         self,
         base_embedder,
         final_transformer,
         prefit_embedder = False,
         use_membership_weights = True,
+        transform_method = "predict_proba"
     ):
         
         """
@@ -210,6 +234,7 @@ class ArchetypeEstimator(BaseEstimator):
         self.final_transformer = final_transformer
         self.prefit_embedder = prefit_embedder
         self.use_membership_weights = use_membership_weights
+        self.transform_method = transform_method
         return
 
     def fit(self, X, y = None, sample_weight = None, **kwargs):
@@ -218,10 +243,11 @@ class ArchetypeEstimator(BaseEstimator):
             base_embedder = clone(self.base_embedder)
             base_embedder.fit(X, y=y, sample_weight=sample_weight)
         else:
-            base_embedder = clone(self.base_embedder)
-        
+            base_embedder = self.base_embedder
+            #base_embedder = clone(self.base_embedder)
+                
         memberships = base_embedder.transform(X)
-        if (memberships.sum(axis = 1) != 1).any():
+        if not (np.isclose(memberships.sum(axis = 1), 1)).all():
             raise ValueError(f"Some membership rows do not sum up to 1")
         
         n_archetypes = memberships.shape[-1]
@@ -231,20 +257,31 @@ class ArchetypeEstimator(BaseEstimator):
             X_sample, y_sample, weights, mask = self._get_subset_and_weights(
                 X=X,
                 y=y,
-                membership=memberships[:,i],
+                membership=memberships[:,i].A.flatten(),
                 sample_weight = sample_weight,
                 use_membership_weights = self.use_membership_weights
             )
             
-            if not weights is None:
-                estim.fit(X=X_sample, y=y_sample, sample_weight=weights)
+            #handle cases where partitions have only one class
+            if len(np.unique(y_sample)) <= 1:
+                estim = _SingleLabelClassifier().fit(X_sample,y_sample)
+                
             else:
-                #to ensure will work with estimators that donnot accept sample_weight parameters in fit
-                estim.fit(X=X_sample, y=y_sample)
+                if not weights is None:
+                    if isinstance(estim, Pipeline):
+                        kwargs = _parse_pipeline_fit_kws(estim, **kwargs)
+                        sample_weights = _parse_pipeline_fit_sample_weight(estim, sample_weight)                
+                        estim.fit(X=X_sample, y=y_sample, **{**kwargs, **sample_weights})                        
+                    else:
+                        estim.fit(X=X_sample, y=y_sample, sample_weight=weights)
+                else:
+                    #to ensure will work with estimators that donnot accept sample_weight parameters in fit
+                    estim.fit(X=X_sample, y=y_sample)
             
             archetype_estimator_list.append(estim)
         
         #save states
+        self.classes_ = np.unique(y)
         self.archetype_estimator_list_ = archetype_estimator_list
         self.base_embedder_ = base_embedder
         self.n_archetypes_ = n_archetypes
@@ -256,6 +293,7 @@ class ArchetypeEstimator(BaseEstimator):
         returns data instances and sample weights for membership > 0
         """
         mask = membership > 0
+        
         X_sample = X[mask]
         
         if not y is None:
@@ -277,54 +315,193 @@ class ArchetypeEstimator(BaseEstimator):
         
         return X_sample, y_sample, weights, mask
     
-    def _infer_matrix(self, infer_method, X, **kwargs):
-        
-        
-        memberships = self.base_embedder_.transform(X)
-        if (memberships.sum(axis = 1) != 1).any():
-            raise ValueError(f"Some membership rows do not sum up to 1")
-        
-        results  = sparse.lil_matrix((X.shape[0], self.n_archetypes_), dtype=np.float32)
-        
-        for i in range(self.n_archetypes_):
-            estim = self.archetype_estimator_list_[i]
-            X_sample, y_sample, weights, mask = self._get_subset_and_weights(
-                X=X,
-                y=None,
-                membership=memberships[:,i],
-                sample_weight = None,
-                use_membership_weights = self.use_membership_weights
-            )
-            res = getattr(estim, infer_method)(X, **kwargs)
-            results[mask,i] = res                    
-        
-        return results
 
     def _infer_reduce(self, infer_method, X, **kwargs):
         
-        memberships = self.base_embedder_.transform(X)
-        if (memberships.sum(axis = 1) != 1).any():
+        memberships = self.base_embedder_.transform(X, **kwargs)
+        if not (np.isclose(memberships.sum(axis = 1), 1)).all():
             raise ValueError(f"Some membership rows do not sum up to 1")
                         
-        results  = sparse.lil_matrix((X.shape[0], self.n_archetypes_), dtype=np.float32)
+        #results  = sparse.lil_matrix((X.shape[0], self.n_archetypes_), dtype=np.float32)
         
+        results = np.zeros((X.shape[0], len(self.classes_)))
         for i in range(self.n_archetypes_):
             estim = self.archetype_estimator_list_[i]
+            class_idx  = np.isin(self.classes_,estim.classes_).nonzero()[0]
+            weights = memberships[:,i].A.reshape(-1,1)
+            
+            res = getattr(estim, infer_method)(X)
+            res_placeholder = np.zeros((X.shape[0], len(self.classes_)))
+            #handle when binary classifier and returns column matrix
+
+            if res.shape[-1] <= 1:
+                class_idx = class_idx[0:1]
+            
+
+            res_placeholder[:, class_idx] = res
+            
+            if not weights is None:
+                res_placeholder = res_placeholder*weights
+            else:
+                pass
+            
+            
+            results += res_placeholder
+            #results[mask,i] = res
+            
+        results = results/memberships.sum(1)#.sum(1)
+        return results
+    
+    def predict_proba(self, X, **kwargs):
+        X = self._infer_reduce("predict_proba", X, **kwargs)
+        return X
+    
+    
+    def transform(self, X):
+        X = self._infer_reduce(self.transform_method, X, **kwargs)
+        return X
+    
+    def predict(self, X):
+        X = self.predict_proba(X)
+        X = X.argmax(1)
+        return X
+    
+
+class ArchetypeEnsembleRegressor(BaseEstimator):
+    def __init__(
+        self,
+        base_embedder,
+        final_transformer,
+        prefit_embedder = False,
+        use_membership_weights = True,
+        transform_method = "predict"
+    ):
+        
+        """
+        An abstract estimator that applies some transformation
+        on data that has a fuzzy membership to a given cluster (or archetype)
+
+        The fit and transform/predict/... processes in each archetype are performed 
+        only in the subset of data that has a positive probability of belonging to that
+        cluster. Then, the individual weight of each data point is given by the membership score of that
+        point. If user defined sample_weight is passed, the final weights during train is the product
+        of both membership scores and sample_weight
+        """
+
+        self.base_embedder = base_embedder
+        self.final_transformer = final_transformer
+        self.prefit_embedder = prefit_embedder
+        self.use_membership_weights = use_membership_weights
+        self.transform_method = transform_method
+        return
+
+    def fit(self, X, y = None, sample_weight = None, **kwargs):
+        
+        if not self.prefit_embedder:
+            base_embedder = clone(self.base_embedder)
+            base_embedder.fit(X, y=y, sample_weight=sample_weight)
+        else:
+            base_embedder = self.base_embedder
+            #base_embedder = clone(self.base_embedder)
+        
+        memberships = base_embedder.transform(X)
+        if not (np.isclose(memberships.sum(axis = 1), 1)).all():
+            raise ValueError(f"Some membership rows do not sum up to 1")
+        
+        n_archetypes = memberships.shape[-1]
+        archetype_estimator_list = []
+        
+        for i in range(n_archetypes):
+            estim = clone(self.final_transformer)
             X_sample, y_sample, weights, mask = self._get_subset_and_weights(
                 X=X,
-                y=None,
-                membership=memberships[:,i],
-                sample_weight = None,
+                y=y,
+                membership=memberships[:,i].A.flatten(),
+                sample_weight = sample_weight,
                 use_membership_weights = self.use_membership_weights
             )
-            res = getattr(estim, infer_method)(X, **kwargs)
+            
+            if not weights is None:
+                if isinstance(estim, Pipeline):
+                    kwargs = _parse_pipeline_fit_kws(estim, **kwargs)
+                    sample_weights = _parse_pipeline_fit_sample_weight(estim, sample_weight)                
+                    estim.fit(X=X_sample, y=y_sample, **{**kwargs, **sample_weights})                        
+                else:
+                    estim.fit(X=X_sample, y=y_sample, sample_weight=weights)
+            else:
+                #to ensure will work with estimators that donnot accept sample_weight parameters in fit
+                estim.fit(X=X_sample, y=y_sample)
+            
+            archetype_estimator_list.append(estim)
+        
+        #save states
+        self.archetype_estimator_list_ = archetype_estimator_list
+        self.base_embedder_ = base_embedder
+        self.n_archetypes_ = n_archetypes
+        return self
+    
+    
+    def _get_subset_and_weights(self, X, y, membership, sample_weight, use_membership_weights):
+        """
+        returns data instances and sample weights for membership > 0
+        """
+        mask = membership > 0
+        
+        X_sample = X[mask]
+        
+        if not y is None:
+            y_sample = y[mask]
+        else:
+            y_sample = None
+        
+
+        if sample_weight is None:
+            if use_membership_weights:
+                weights = membership[mask]
+            else:
+                weights = None
+        else:
+            if use_membership_weights:
+                weights = sample_weight[mask]*membership[mask]
+            else:
+                weights = sample_weight[mask]
+        
+        return X_sample, y_sample, weights, mask
+    
+
+    def _infer_reduce(self, infer_method, X, **kwargs):
+        
+        memberships = self.base_embedder_.transform(X, **kwargs)
+        if not (np.isclose(memberships.sum(axis = 1), 1)).all():
+            raise ValueError(f"Some membership rows do not sum up to 1")
+                        
+        #results  = sparse.lil_matrix((X.shape[0], self.n_archetypes_), dtype=np.float32)
+        
+        results = np.zeros((X.shape[0],))
+        for i in range(self.n_archetypes_):
+            
+            estim = self.archetype_estimator_list_[i]
+            weights = memberships[:,i].A.reshape(-1,1)
+            
+            res = getattr(estim, infer_method)(X)
             
             if not weights is None:
                 res = res*weights
             else:
                 pass
             
-            results[mask,i] = res
             
-        results = results.sum(1)
-        return results
+            results += res
+            #results[mask,i] = res
+            
+        results = results/memberships.sum(1)#.sum(1)
+        return results    
+    
+    def predict(self, X, **kwargs):
+        X = self._infer_reduce("predict", X, **kwargs)
+        return X
+    
+    
+    def transform(self, X):
+        X = self._infer_reduce(self.transform_method, X, **kwargs)
+        return X    

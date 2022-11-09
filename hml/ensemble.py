@@ -1,3 +1,5 @@
+import inspect
+
 import numpy as np
 import pandas as pd
 
@@ -21,6 +23,7 @@ import networkx as nx
 
 from umap import UMAP
 
+from .utils import _parse_pipeline_fit_kws, _parse_pipeline_fit_sample_weight
 #lgbm custom estimators
 
 
@@ -496,15 +499,15 @@ class ArchetypeEncoder(BaseEstimator, TransformerMixin):
         return pointwise_membership
             
     
-    def fit(self, X, y = None, sample_weight = None):
+    def fit(self, X, y = None, sample_weight = None, **kwargs):
                 
         #fit estimator        
         if not self.prefit_ensemble:
             self.ensemble_estimator = clone(self.ensemble_estimator)
             if isinstance(self.ensemble_estimator, Pipeline):
-                last_estim_name = list(self.ensemble_estimator.named_steps)[-1]
-                kwargs = {f"{last_estim_name}__{k}":v for k,v in self.ensemble_fit_kwargs.items()}
-                self.ensemble_estimator.fit(X=X, y=y, **{**{f"{last_estim_name}__sample_weight":sample_weight}, **kwargs})
+                kwargs = _parse_pipeline_fit_kws(self.ensemble_estimator, **kwargs)
+                sample_weights = _parse_pipeline_fit_sample_weight(self.ensemble_estimator, sample_weight)                
+                self.ensemble_estimator.fit(X=X, y=y, **{**kwargs, **sample_weights})
             else:
                 self.ensemble_estimator.fit(X=X, y=y, sample_weight=sample_weight, **self.ensemble_fit_kwargs)
         else:
@@ -760,7 +763,7 @@ class HeterogeneousMixedForest(MixedForestArchetypeEncoder):
 #export
 class MixedForestRegressor(MixedForestArchetypeEncoder):
     
-    def fit(self, X, y = None, sample_weight = None):
+    def fit(self, X, y = None, sample_weight = None, **kwargs):
                 
         #check if multidim output
         if len(y.shape) > 1:
@@ -785,8 +788,9 @@ class MixedForestRegressor(MixedForestArchetypeEncoder):
             if self.use_already_fitted:
                 if not check_is_fitted(estim):
                     if isinstance(estim, Pipeline):
-                        last_estim_name = list(estim.named_steps)[-1]
-                        estim.fit(X=X, y=y, **{f"{last_estim_name}__sample_weight":sample_weight})
+                        kwargs = _parse_pipeline_fit_kws(estim, **kwargs)
+                        sample_weights = _parse_pipeline_fit_sample_weight(estim, sample_weight)                
+                        estim.fit(X=X, y=y, **{**kwargs, **sample_weights})                        
                     else:
                         estim.fit(X=X, y=y, sample_weight=sample_weight)
                     
@@ -794,8 +798,9 @@ class MixedForestRegressor(MixedForestArchetypeEncoder):
                     warn(f"{estim} is already fitted and use_already_fitted was set to True in the constructor. The estimator won't be fitted, so ensure compatibility of inputs and outputs.")
             else:                
                 if isinstance(estim, Pipeline):
-                    last_estim_name = list(estim.named_steps)[-1]
-                    estim.fit(X=X, y=y, **{f"{last_estim_name}__sample_weight":sample_weight})
+                    kwargs = _parse_pipeline_fit_kws(estim, **kwargs)
+                    sample_weights = _parse_pipeline_fit_sample_weight(estim, sample_weight)                
+                    estim.fit(X=X, y=y, **{**kwargs, **sample_weights})                        
                 else:
                     estim.fit(X=X, y=y, sample_weight=sample_weight)
         
@@ -830,7 +835,7 @@ class MixedForestRegressor(MixedForestArchetypeEncoder):
 #export
 class MixedForestClassifier(MixedForestArchetypeEncoder):            
     
-    def fit(self, X, y = None, sample_weight = None):
+    def fit(self, X, y = None, sample_weight = None, **kwargs):
                 
         #check if multidim output
         if len(y.shape) > 1:
@@ -860,16 +865,18 @@ class MixedForestClassifier(MixedForestArchetypeEncoder):
             if self.use_already_fitted:
                 if not check_is_fitted(estim):
                     if isinstance(estim, Pipeline):
-                        last_estim_name = list(estim.named_steps)[-1]
-                        estim.fit(X=X, y=y, **{f"{last_estim_name}__sample_weight":sample_weight})
+                        kwargs = _parse_pipeline_fit_kws(estim, **kwargs)
+                        sample_weights = _parse_pipeline_fit_sample_weight(estim, sample_weight)                
+                        estim.fit(X=X, y=y, **{**kwargs, **sample_weights})                        
                     else:
                         estim.fit(X=X, y=y, sample_weight=sample_weight)
                 else:
                     warn(f"{estim} is already fitted and use_already_fitted was set to True in the constructor. The estimator won't be fitted, so ensure compatibility of inputs and outputs.")
             else:                
                 if isinstance(estim, Pipeline):
-                    last_estim_name = list(estim.named_steps)[-1]
-                    estim.fit(X=X, y=y, **{f"{last_estim_name}__sample_weight":sample_weight})
+                    kwargs = _parse_pipeline_fit_kws(estim, **kwargs)
+                    sample_weights = _parse_pipeline_fit_sample_weight(estim, sample_weight)                
+                    estim.fit(X=X, y=y, **{**kwargs, **sample_weights})                        
                 else:
                     estim.fit(X=X, y=y, sample_weight=sample_weight)
                                 
@@ -989,15 +996,15 @@ class TargetArchetypeEncoder(BaseEstimator, TransformerMixin):
     def __getattr__(self, attr):
         return getattr(self.estimator, attr)
             
-    def fit(self, X, y = None, sample_weight = None):
+    def fit(self, X, y = None, sample_weight = None, **kwargs):
                 
         #fit estimator        
         if not self.prefit_estimator:
             self.estimator = clone(self.estimator)
             if isinstance(self.estimator, Pipeline):
-                last_estim_name = list(self.estimator.named_steps)[-1]
-                kws = {f"{last_estim_name}__{k}":v for k,v in self.estimator_fit_kwargs.items()}
-                self.estimator.fit(X=X, y=y, **{**kws, **{f"{last_estim_name}__sample_weight":sample_weight}})
+                kwargs = _parse_pipeline_fit_kws(self.estimator, **kwargs)
+                sample_weights = _parse_pipeline_fit_sample_weight(self.estimator, sample_weight)                
+                self.estimator.fit(X=X, y=y, **{**kwargs, **sample_weights})                        
             else:
                 self.estimator.fit(X=X, y=y, sample_weight=sample_weight, **self.estimator_fit_kwargs)
                         
