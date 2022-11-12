@@ -276,3 +276,26 @@ def _parse_pipeline_fit_sample_weight(pipeline, sample_weight):
     weight_estim_names = [k for k,v in pipeline.named_steps.items() if "sample_weight" in inspect.signature(v.fit).parameters]
     sample_weights = {f"{name}__sample_weight":sample_weight for name in weight_estim_names}                
     return sample_weights
+
+
+from sklearn.pipeline import Pipeline
+
+def _parse_pipeline_sample_weight_and_kwargs(estimator, sample_weight, **kwargs):
+    """
+    prases sample wieghts and kwargs. if estimator is a sklearn pipeline for all estimators in the pipeline that accepts the kwargs,
+    this parser will return a dictionary containing args in the format <estimator_name>__<arg_name>, as it is accepted in sklearn pipeline fit API
+    
+    if estimator is not a pipeline, will return a dictionary resembling the original parametr names and their values
+    
+    Returns
+    -------
+    
+    sample_weights dict, kws dict
+    """
+    if isinstance(estimator, Pipeline):
+        kws = _parse_pipeline_fit_kws(estimator, **kwargs)
+        sample_weights = _parse_pipeline_fit_sample_weight(estimator, sample_weight)
+        return sample_weights, kws
+    
+    else:
+        return {"sample_weight": sample_weight}, kwargs

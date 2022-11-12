@@ -1,0 +1,8 @@
+pandas
+scikit-learn
+scikit-network
+umap-learn
+networkx
+lightgbm
+tqdm
+sparse_dot_topn

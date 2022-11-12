@@ -3,27 +3,30 @@ import inspect
 import numpy as np
 import pandas as pd
 
-from sklearn.base import BaseEstimator
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, normalize
 from sklearn.pipeline import make_pipeline, Pipeline
 from sklearn.base import TransformerMixin, BaseEstimator, clone
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, MiniBatchKMeans
+from sklearn.random_projection import GaussianRandomProjection
+from sklearn.ensemble._forest import BaseForest
 
 from joblib import effective_n_jobs, Parallel, delayed
 
 from sknetwork.clustering import KMeans as GraphKMeans
-from sknetwork.clustering import PropagationClustering,Louvain
+from sknetwork.clustering import PropagationClustering, Louvain
 
-from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor
+from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor, LGBMModel
 
 from scipy import sparse
 
-from utils import hstack, sparse_dot_product
+
 import networkx as nx
 
 from umap import UMAP
 
-from .utils import _parse_pipeline_fit_kws, _parse_pipeline_fit_sample_weight
+from .utils import hstack, sparse_dot_product
+from .utils import _parse_pipeline_fit_kws, _parse_pipeline_fit_sample_weight, _parse_pipeline_sample_weight_and_kwargs
+
 #lgbm custom estimators
 
 
@@ -390,8 +393,292 @@ def _postprocess_node_points(points, n_neighbors, sample_size):
 ###    Archetype encoding and embedding    ###
 ##############################################
 
+class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
+    
+    def __init__(
+        self,
+        ensemble_estimator,        
+        embedder = GaussianRandomProjection(50),
+        clusterer = MiniBatchKMeans(10),
+        boosting_leaf_weights_strategy = "cumulative_unit_gain",
+        alpha = 1,
+        beta = 1,  
+        fuzzy_membership = False,
+        prefit_ensemble = False,
+        n_jobs = None,
 
-class ArchetypeEncoder(BaseEstimator, TransformerMixin):
+    ):
+        
+        self.ensemble_estimator = ensemble_estimator
+        self.embedder = embedder
+        self.clusterer = clusterer
+        self.alpha = alpha
+        self.beta = beta                
+        self.fuzzy_membership = fuzzy_membership
+        self.n_jobs = n_jobs
+
+        self.prefit_ensemble = prefit_ensemble
+        self.boosting_leaf_weights_strategy = boosting_leaf_weights_strategy
+        return
+    
+        
+    def __getattr__(self, attr):
+        return getattr(self.ensemble_estimator, attr)
+    
+    def _get_leaf_biadjecency_matrix(self, X, beta, sample_weight):
+        
+        biadjecency_matrix = self.ensemble_estimator_.transform(X)                        
+        
+        if not beta is None:
+            biadjecency_matrix.data = biadjecency_matrix.data**beta
+        
+        if not sample_weight is None:
+            biadjecency_matrix = biadjecency_matrix.multiply(sample_weight.reshape(-1,1))
+            biadjecency_matrix = sparse.csr_matrix(biadjecency_matrix)
+        
+        return biadjecency_matrix
+    
+    def _get_archetype_membership(self, X, leaf_memberships, alpha):
+        
+        pointwise_membership = sparse_dot_product(X,
+                                                  leaf_memberships,
+                                                  ntop = None,
+                                                  lower_bound=0,
+                                                  use_threads=False,
+                                                  n_jobs=self.n_jobs,
+                                                  return_best_ntop=False,
+                                                  test_nnz_max=-1,
+                                                 )
+        
+        pointwise_membership.data = pointwise_membership.data**alpha        
+        pointwise_membership = normalize(pointwise_membership, norm = "l1")
+        
+        return pointwise_membership
+            
+    
+    def fit(self, X, y = None, sample_weight = None, **kwargs):
+        
+        # set estimators
+        if not self.embedder is None:            
+            embedder_ = clone(self.embedder)
+        else:
+            embedder_ = FunctionTransformer()
+        
+        clusterer_ = clone(self.clusterer)
+        
+        #set ensemble transformers
+        #if sklearn forest
+        #if lgbm
+        if isinstance(self.ensemble_estimator, LGBMClassifier):            
+            ensemble_estimator = LGBMClassificationTransformer(**self.ensemble_estimator.get_params())
+            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
+        
+        elif isinstance(self.ensemble_estimator, LGBMRegressor):            
+            ensemble_estimator = LGBMRegressionTransformer(**self.ensemble_estimator.get_params())
+            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
+        
+        elif isinstance(self.ensemble_estimator, LGBMRanker):            
+            ensemble_estimator = LGBMRankingTransformer(**self.ensemble_estimator.get_params())
+            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
+        
+        elif isinstance(self.ensemble_estimator, BaseForest):
+            ensemble_estimator = _ForestTransformer(self.ensemble_estimator)
+        else:
+            raise TypeError(f"for now, only lightgbm.LGBMModel or sklearn.ensemble._forest.BaseForest instances are accepted as ensemble estimator")
+        
+        #fit estimator
+        self.ensemble_estimator_ = clone(ensemble_estimator)
+        if not self.prefit_ensemble:            
+            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.ensemble_estimator_, sample_weight, **kwargs)            
+            self.ensemble_estimator_.fit(X=X, y=y, **{**kws, **sample_weights})            
+        else:
+            pass
+        
+        #fit one hot encoders of the nodes        
+        leaf_adjacency_matrix = self._get_leaf_biadjecency_matrix(X, self.beta, sample_weight)
+        #find graph comunities        
+        instance_embs = embedder_.fit_transform(leaf_adjacency_matrix)
+        clusterer_.fit(instance_embs)
+        instance_clusters = clusterer_.predict(instance_embs)        
+        instance_memberships = OneHotEncoder().fit_transform(instance_clusters.reshape(-1,1))           
+
+        
+        leaf_memberships = sparse_dot_product(leaf_adjacency_matrix.T,
+                                              instance_memberships,
+                                              ntop = None,
+                                              lower_bound=0,
+                                              use_threads=False,
+                                              n_jobs=self.n_jobs,
+                                              return_best_ntop=False,
+                                              test_nnz_max=-1,
+                                             )
+        
+        leaf_memberships = normalize(leaf_memberships, norm = "l1")
+        
+        self.embedder_ = embedder_
+        self.clusterer_ = clusterer_
+        self.ensemble_estimator_ = self.ensemble_estimator_
+        self.leaf_memberships_ = leaf_memberships
+        return self
+        
+    def transform(self, X, alpha = None):
+        
+        if alpha is None:
+            alpha = self.alpha
+        
+        X = self._get_leaf_biadjecency_matrix(X, beta=self.beta, sample_weight=None)
+        pointwise_membership = self._get_archetype_membership(X, self.leaf_memberships_, alpha)                    
+        return pointwise_membership    
+
+class ClusterArchetypeEncoder2(BaseEstimator, TransformerMixin):
+    
+    def __init__(
+        self,
+        ensemble_estimator,        
+        leaf_embedder,
+        leaf_clusterer,
+        boosting_leaf_weights_strategy = "cumulative_unit_gain",
+        alpha = 1,
+        beta = 1,  
+        use_leaf_weights = False,
+        fuzzy_membership = False,
+        prefit_ensemble = False,
+        n_jobs = None,
+
+    ):
+        
+        self.ensemble_estimator = ensemble_estimator
+        self.leaf_embedder = leaf_embedder
+        self.leaf_clusterer = leaf_clusterer
+        self.alpha = alpha
+        self.beta = beta                
+        self.fuzzy_membership = fuzzy_membership
+        self.n_jobs = n_jobs
+
+        self.use_leaf_weights = use_leaf_weights
+        self.prefit_ensemble = prefit_ensemble
+        self.boosting_leaf_weights_strategy = boosting_leaf_weights_strategy
+        return
+    
+        
+    def __getattr__(self, attr):
+        return getattr(self.ensemble_estimator, attr)
+    
+    def _get_leaf_biadjecency_matrix(self, X, beta, sample_weight):
+        
+        biadjecency_matrix = self.ensemble_estimator_.transform(X)                        
+        
+        if not beta is None:
+            biadjecency_matrix.data = biadjecency_matrix.data**beta
+        
+        if not sample_weight is None:
+            biadjecency_matrix = biadjecency_matrix.multiply(sample_weight.reshape(-1,1))
+            biadjecency_matrix = sparse.csr_matrix(biadjecency_matrix)
+        
+        return biadjecency_matrix
+    
+    def _get_archetype_membership(self, X, leaf_memberships, alpha):
+        
+        pointwise_membership = sparse_dot_product(X,
+                                                  leaf_memberships,
+                                                  ntop = None,
+                                                  lower_bound=0,
+                                                  use_threads=False,
+                                                  n_jobs=self.n_jobs,
+                                                  return_best_ntop=False,
+                                                  test_nnz_max=-1,
+                                                 )
+        
+        pointwise_membership.data = pointwise_membership.data**alpha        
+        pointwise_membership = normalize(pointwise_membership, norm = "l1")
+        
+        return pointwise_membership
+            
+    
+    def fit(self, X, y = None, sample_weight = None, **kwargs):
+        
+        # set estimators
+        if not self.leaf_embedder is None:            
+            leaf_embeder_ = clone(self.leaf_embedder)
+        else:
+            leaf_embeder_ = FunctionTransformer()
+        
+        leaf_clusterer_ = clone(self.leaf_clusterer)
+        
+        #set ensemble transformers
+        #if sklearn forest
+        #if lgbm
+        if isinstance(self.ensemble_estimator, LGBMClassifier):            
+            ensemble_estimator = LGBMClassificationTransformer(**self.ensemble_estimator.get_params())
+            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
+        
+        elif isinstance(self.ensemble_estimator, LGBMRegressor):            
+            ensemble_estimator = LGBMRegressionTransformer(**self.ensemble_estimator.get_params())
+            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
+        
+        elif isinstance(self.ensemble_estimator, LGBMRanker):            
+            ensemble_estimator = LGBMRankingTransformer(**self.ensemble_estimator.get_params())
+            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
+        
+        elif isinstance(self.ensemble_estimator, BaseForest):
+            ensemble_estimator = _ForestTransformer(self.ensemble_estimator)
+        else:
+            raise TypeError(f"for now, only lightgbm.LGBMModel or sklearn.ensemble._forest.BaseForest instances are accepted as ensemble estimator")
+        
+        #fit estimator
+        self.ensemble_estimator_ = clone(ensemble_estimator)
+        if not self.prefit_ensemble:            
+            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.ensemble_estimator_, sample_weight, **kwargs)            
+            self.ensemble_estimator_.fit(X=X, y=y, **{**kws, **sample_weights})            
+        else:
+            pass
+        
+        #fit one hot encoders of the nodes        
+        leaf_adjacency_matrix = self._get_leaf_biadjecency_matrix(X, self.beta, sample_weight)
+        #find graph comunities        
+        leaf_embs = leaf_embeder_.fit_transform(leaf_adjacency_matrix.T)
+        leaf_clusterer_.fit(leaf_embs)
+        leaf_clusters = leaf_clusterer_.predict(leaf_embs)        
+        leaf_memberships = OneHotEncoder().fit_transform(leaf_clusters.reshape(-1,1))                
+
+        self.leaf_embeder_ = leaf_embeder_
+        self.leaf_clusterer_ = leaf_clusterer_
+        self.ensemble_estimator_ = self.ensemble_estimator_
+        self.leaf_memberships_ = leaf_memberships
+        return self
+        
+    def transform(self, X, alpha = None):
+        
+        if alpha is None:
+            alpha = self.alpha
+        
+        X = self._get_leaf_biadjecency_matrix(X, beta=self.beta, sample_weight=None)
+        pointwise_membership = self._get_archetype_membership(X, self.leaf_memberships_, alpha)                    
+        return pointwise_membership    
+
+
+class _ForestTransformer(BaseEstimator, TransformerMixin):
+    
+    def __init__(self, forest):
+        self.forest = forest
+        return
+        
+    def __getattr__(self, attr):
+        return getattr(self.forest, attr)
+    
+    def fit(self, X, y = None, sample_weight = None, **kwargs):
+        self.forest.fit(X, y = y, sample_weight = sample_weight, **kwargs)
+        leafs = self.forest.apply(X)
+        self.leafs_onehotencoder_ = OneHotEncoder().fit(leafs)
+        return self                
+        
+    def transform(self, X):
+        X = self.apply(X)
+        X = self.leafs_onehotencoder_.transform(X)        
+        return X
+    
+
+class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
     
     def __init__(
         self,
@@ -399,12 +686,12 @@ class ArchetypeEncoder(BaseEstimator, TransformerMixin):
         n_archetypes = 100,
         alpha = 1,
         beta = 1,
+        boosting_leaf_weights_strategy = "cumulative_information_gain",
         graph_cluster_method = "kmeans",
         use_leaf_weights = False,
         fuzzy_membership = False,
         prefit_ensemble = False,
         n_jobs = None,
-        ensemble_fit_kwargs = {},
         **graph_clustering_kwargs,
 
     ):
@@ -419,7 +706,7 @@ class ArchetypeEncoder(BaseEstimator, TransformerMixin):
         self.use_leaf_weights = use_leaf_weights
         self.prefit_ensemble = prefit_ensemble
         self.graph_cluster_method = graph_cluster_method
-        self.ensemble_fit_kwargs = ensemble_fit_kwargs
+        self.boosting_leaf_weights_strategy = boosting_leaf_weights_strategy
         return
     
         
@@ -448,14 +735,6 @@ class ArchetypeEncoder(BaseEstimator, TransformerMixin):
         
         graph_embedder = method.fit(leaf_biadjacency_matrix)
         return graph_embedder
-        
-        X.data = X.data**gamma
-        if not sample_weight is None:
-            com_detector = GraphKMeans(n_clusters = n_archetypes, **graph_clustering_kwargs).fit(X.multiply(sample_weight.reshape(-1,1)))
-        else:
-            com_detector = GraphKMeans(n_clusters = n_archetypes, **graph_clustering_kwargs).fit(X)
-        
-        return com_detector
     
     
     def _get_leaf_biadjecency_matrix(self, X, beta, sample_weight):
@@ -501,15 +780,28 @@ class ArchetypeEncoder(BaseEstimator, TransformerMixin):
     
     def fit(self, X, y = None, sample_weight = None, **kwargs):
                 
+        if isinstance(self.ensemble_estimator, LGBMClassifier):            
+            ensemble_estimator = LGBMClassificationTransformer(**self.ensemble_estimator.get_params())
+            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
+        
+        elif isinstance(self.ensemble_estimator, LGBMRegressor):            
+            ensemble_estimator = LGBMRegressionTransformer(**self.ensemble_estimator.get_params())
+            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
+        
+        elif isinstance(self.ensemble_estimator, LGBMRanker):            
+            ensemble_estimator = LGBMRankingTransformer(**self.ensemble_estimator.get_params())
+            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
+        
+        elif isinstance(self.ensemble_estimator, BaseForest):
+            ensemble_estimator = _ForestTransformer(self.ensemble_estimator)
+        else:
+            raise TypeError(f"for now, only lightgbm.LGBMModel or sklearn.ensemble._forest.BaseForest instances are accepted as ensemble estimator")
+        
         #fit estimator        
         if not self.prefit_ensemble:
-            self.ensemble_estimator = clone(self.ensemble_estimator)
-            if isinstance(self.ensemble_estimator, Pipeline):
-                kwargs = _parse_pipeline_fit_kws(self.ensemble_estimator, **kwargs)
-                sample_weights = _parse_pipeline_fit_sample_weight(self.ensemble_estimator, sample_weight)                
-                self.ensemble_estimator.fit(X=X, y=y, **{**kwargs, **sample_weights})
-            else:
-                self.ensemble_estimator.fit(X=X, y=y, sample_weight=sample_weight, **self.ensemble_fit_kwargs)
+            self.ensemble_estimator = clone(self.ensemble_estimator)            
+            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.ensemble_estimator, sample_weight, **kwargs)
+            self.ensemble_estimator.fit(X=X, y=y, **{**kws, **sample_weights})                        
         else:
             pass
         
@@ -562,7 +854,7 @@ class ArchetypeEncoder(BaseEstimator, TransformerMixin):
     
 
     
-class MixedForestArchetypeEncoder(ArchetypeEncoder):
+class MixedForestGraphArchetypeEncoder(GraphArchetypeEncoder):
     
     def __init__(
         self,
@@ -626,7 +918,7 @@ class MixedForestArchetypeEncoder(ArchetypeEncoder):
         
         Returns
         -------
-        MixedForestArchetypeEncoder object
+        MixedForestArchetypeGraphEncoder object
         
         '''
         self.estimators = estimators        
@@ -728,7 +1020,7 @@ class MixedForestArchetypeEncoder(ArchetypeEncoder):
 
     
 #export   
-class HeterogeneousMixedForest(MixedForestArchetypeEncoder):
+class HeterogeneousMixedForest(MixedForestGraphArchetypeEncoder):
     
     def fit(self, X, y = None, sample_weight = None):                        
                     
@@ -761,7 +1053,7 @@ class HeterogeneousMixedForest(MixedForestArchetypeEncoder):
 
     
 #export
-class MixedForestRegressor(MixedForestArchetypeEncoder):
+class MixedForestRegressor(MixedForestGraphArchetypeEncoder):
     
     def fit(self, X, y = None, sample_weight = None, **kwargs):
                 
@@ -833,7 +1125,7 @@ class MixedForestRegressor(MixedForestArchetypeEncoder):
         return result
     
 #export
-class MixedForestClassifier(MixedForestArchetypeEncoder):            
+class MixedForestClassifier(MixedForestGraphArchetypeEncoder):            
     
     def fit(self, X, y = None, sample_weight = None, **kwargs):
                 
@@ -1049,7 +1341,7 @@ class TargetArchetypeEncoder(BaseEstimator, TransformerMixin):
     
 from sklearn.base import TransformerMixin, BaseEstimator
 
-class ArchetypeUMAP(BaseEstimator, TransformerMixin):
+class GraphArchetypeUMAP(BaseEstimator, TransformerMixin):
     
     def __init__(
         self,
@@ -1161,6 +1453,193 @@ class ArchetypeUMAP(BaseEstimator, TransformerMixin):
                 leaf_memberships = normalize(leaf_memberships, "l1")
             else:
                 leaf_memberships = com_detector.membership_col_
+                
+            agg_network = self._preprocess_aggregate_graph(agg_network, beta=self.beta, normalize_connections=self.normalize_connections)
+            importances = agg_network.sum(1).A            
+            sizes = agg_network.diagonal()                         
+            #
+            
+            
+        else:
+            del X
+            agg_network = self._preprocess_aggregate_graph(self.archetype_aggregate_community_graph, beta=self.beta, normalize_connections=self.normalize_connections)
+            importances = agg_network.sum(1).A
+            sizes = agg_network.diagonal()
+            leaf_memberships = None
+        
+        #fit aggregate graph embeddings
+        net_embs = self._get_community_embeddings(agg_network,
+                                                  metric = self.metric,
+                                                  n_neighbors=self.n_neighbors,
+                                                  n_components=self.n_components,
+                                                  **self.umap_kwargs
+                                                 )
+        
+        self.archetype_importances_ = importances
+        self.archetype_sizes_ = sizes
+        self.agg_network_ = agg_network
+        self.network_embeddings_ = net_embs
+        self.leaf_memberships_ = leaf_memberships
+        return self
+        
+    def transform(self, X, alpha = None):
+        
+        if alpha is None:
+            alpha = self.alpha
+        
+        pointwise_membership = self._get_archetype_membership(X, self.leaf_memberships_, alpha)
+        
+        embs = sparse_dot_product(pointwise_membership,
+                                  self.network_embeddings_,
+                                  ntop = None,
+                                  lower_bound=0,
+                                  use_threads=False,
+                                  n_jobs=self.n_jobs,
+                                  return_best_ntop=False,
+                                  test_nnz_max=-1,
+                                 )
+        
+        if sparse.issparse(embs):
+            embs = embs.A    
+        return embs
+    
+    
+class ClusterArchetypeUMAP(BaseEstimator, TransformerMixin):
+    
+    def __init__(
+        self,
+        n_components=2,
+        *,
+        embedder = GaussianRandomProjection(50),
+        clusterer = MiniBatchKMeans(100),
+        n_neighbors=15,
+        metric='cosine',
+        normalize_connections = "l1",
+        input_archetype_membership = False,
+        fuzzy_membership = False,
+        alpha = 1,
+        beta = 1,
+        gamma = 1,                
+        n_jobs = None,
+        archetype_aggregate_community_graph = None,
+        umap_kwargs = {},        
+    ):
+        
+        self.clusterer = clusterer
+        self.embedder = embedder
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.n_neighbors = n_neighbors
+        self.n_components = n_components
+        self.metric = metric 
+        self.normalize_connections = normalize_connections
+        self.input_archetype_membership = input_archetype_membership
+        self.archetype_aggregate_community_graph = archetype_aggregate_community_graph
+        self.fuzzy_membership = fuzzy_membership
+        self.n_jobs = n_jobs
+        self.umap_kwargs = umap_kwargs
+        return
+    
+        
+    def _get_leaf_membership_and_agg_netowrk(self, X, sample_weight, gamma):
+        
+        X.data = X.data**gamma        
+        embs = self.embedder.fit_transform(X)
+        clusters = self.clusterer.fit_predict(embs, sample_weight=sample_weight)
+        
+        instance_memberships = OneHotEncoder().fit_transform(clusters.reshape(-1,1))
+        agg_cluster_network = sparse_dot_product(instance_memberships.T,
+                                                  instance_memberships,
+                                                  ntop = None,
+                                                  lower_bound=0,
+                                                  use_threads=False,
+                                                  n_jobs=self.n_jobs,
+                                                  return_best_ntop=False,
+                                                  test_nnz_max=-1,
+                                                 )
+
+
+        leaf_memberships = sparse_dot_product(X.T,
+                                              instance_memberships,
+                                              ntop = None,
+                                              lower_bound=0,
+                                              use_threads=False,
+                                              n_jobs=self.n_jobs,
+                                              return_best_ntop=False,
+                                              test_nnz_max=-1,
+                                             )
+
+        leaf_memberships = normalize(leaf_memberships, norm = "l1")
+
+        return leaf_memberships, instance_memberships, agg_cluster_network
+    
+    def _get_archetype_membership(self, X, leaf_memberships, alpha):
+        
+        if not self.input_archetype_membership:
+            
+            pointwise_membership = sparse_dot_product(X,
+                                                      leaf_memberships,
+                                                      ntop = None,
+                                                      lower_bound=0,
+                                                      use_threads=False,
+                                                      n_jobs=self.n_jobs,
+                                                      return_best_ntop=False,
+                                                      test_nnz_max=-1,
+                                                     )
+
+        else:
+            pointwise_membership = X
+        
+        pointwise_membership.data = pointwise_membership.data**alpha        
+        pointwise_membership = normalize(pointwise_membership, norm = "l1")
+        
+        return pointwise_membership
+    
+    def _preprocess_aggregate_graph(self, agg_network, beta, normalize_connections):
+                
+        #agg_network.setdiag(0)
+        #agg_network.data = 1/minmax_scale(agg_network.data.reshape(-1,1), (1e-1,1e1)).flatten()
+        #agg_network = normalize(agg_network, "l1")
+        agg_network = agg_network.copy()
+        agg_network.data = agg_network.data**beta
+        
+        if not normalize_connections is None:
+            agg_network = normalize(agg_network, normalize_connections)
+
+        agg_network.eliminate_zeros()        
+        return agg_network
+    
+    def _get_community_embeddings(self, agg_network, **umap_kwargs):
+        net_embs = UMAP(**umap_kwargs).fit_transform(agg_network)
+        return net_embs
+    
+    def fit(self, X, y = None, sample_weight = None):
+        
+        if not self.input_archetype_membership:        
+            X = sparse.csr_matrix(X)
+            #find graph comunities
+            
+            
+            leaf_memberships, instance_memberships, agg_cluster_network = self._get_leaf_membership_and_agg_netowrk(X,                                                     
+                                                     sample_weight=sample_weight,
+                                                     gamma=self.gamma)
+            
+            agg_network = agg_cluster_network
+            #
+            if self.fuzzy_membership:
+                leaf_memberships = sparse_dot_product(X.T,
+                                                      instance_memberships,
+                                                      ntop = None,
+                                                      lower_bound=0,
+                                                      use_threads=False,
+                                                      n_jobs=self.n_jobs,
+                                                      return_best_ntop=False,
+                                                      test_nnz_max=-1,
+                                                     )
+                leaf_memberships = normalize(leaf_memberships, "l1")
+            else:
+                leaf_memberships = leaf_memberships
                 
             agg_network = self._preprocess_aggregate_graph(agg_network, beta=self.beta, normalize_connections=self.normalize_connections)
             importances = agg_network.sum(1).A            
