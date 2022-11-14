@@ -273,7 +273,7 @@ class ArchetypeEnsembleClassifier(BaseEstimator):
                 
             else:
                 if not weights is None:
-                    sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(estim, sample_weight, **kwargs)
+                    sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(estim, weights, **kwargs)
                     estim.fit(X=X_sample, y=y_sample, **{**kws, **sample_weights})                    
                 else:
                     #to ensure will work with estimators that donnot accept sample_weight parameters in fit

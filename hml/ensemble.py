@@ -4,7 +4,7 @@ from copy import deepcopy
 import numpy as np
 import pandas as pd
 
-from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, normalize
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, normalize, FunctionTransformer
 from sklearn.pipeline import make_pipeline, Pipeline
 from sklearn.base import TransformerMixin, BaseEstimator, clone
 from sklearn.cluster import KMeans, MiniBatchKMeans
@@ -19,7 +19,7 @@ from sknetwork.clustering import PropagationClustering, Louvain
 from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor, LGBMModel
 
 from scipy import sparse
-
+from scipy.special import softmax
 
 import networkx as nx
 
@@ -106,7 +106,7 @@ class LGBMTransformer():
         """        
         
         if not self.prefit_estimator:            
-            self.lgbm_estimator = clone(lgbm_estimator)
+            self.lgbm_estimator = clone(self.lgbm_estimator)
             sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.lgbm_estimator, sample_weight, **kwargs)            
             self.lgbm_estimator.fit(X=X, y=y, **{**kws, **sample_weights})            
         else:
@@ -412,6 +412,7 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         boosting_leaf_weight_strategy = "cumulative_unit_gain",
         alpha = 1,
         beta = 1,  
+        normalization = "l1",
         fuzzy_membership = False,
         prefit_ensemble = False,
         n_jobs = None,
@@ -425,15 +426,12 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         self.beta = beta                
         self.fuzzy_membership = fuzzy_membership
         self.n_jobs = n_jobs
+        self.normalization = normalization
 
         self.prefit_ensemble = prefit_ensemble
         self.boosting_leaf_weight_strategy = boosting_leaf_weight_strategy
         return
-    
         
-    def __getattr__(self, attr):
-        return getattr(self.ensemble_estimator, attr)
-    
     
     def fit(self, X, y = None, sample_weight = None, **kwargs):
         
@@ -449,7 +447,7 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         #if sklearn forest
         #if lgbm
         if isinstance(self.ensemble_estimator, LGBMModel):            
-            ensemble_estimator = LGBMTransformer(ensemble_estimator, leaf_weight_strategy = self.boosting_leaf_weight_strategy, prefit_estimator = self.prefit_ensemble)  
+            ensemble_estimator = LGBMTransformer(self.ensemble_estimator, leaf_weight_strategy = self.boosting_leaf_weight_strategy, prefit_estimator = self.prefit_ensemble)  
         
         elif isinstance(self.ensemble_estimator, BaseForest):
             ensemble_estimator = ForestTransformer(self.ensemble_estimator)
@@ -461,28 +459,38 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
             [
                 ("ensemble_transformer", ensemble_estimator),
                 ("embedder", embedder_),
-                ("clusterer", clusterer_),
-                ("sparsifier", FunctionTransformer(sparse.csr_matrix))
+                ("clusterer", clusterer_),                
+                ("sparsifier", FunctionTransformer(sparse.csr_matrix)),
             ]
         )
         
         sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(pipe, sample_weight, **kwargs)
         pipe.fit(X, y, **{**sample_weights, **kws})
         
-        self.ensemble_estimator_ = self.ensemble_estimator_
+        self.ensemble_estimator_ = pipe.named_steps["ensemble_transformer"]
         self.processing_pipe_ = pipe
         return self
         
-    def transform(self, X, alpha = None):
+    def transform(self, X, alpha = None, normalization=None):
         
         if alpha is None:
             alpha = self.alpha
+        if normalization is None:
+            normalization = self.normalization
         
-        pointwise_membership = pipe.transform(pointwise_membership)
+        pointwise_membership = self.processing_pipe_.transform(X)
+        pointwise_membership.data = 1/pointwise_membership.data        
         if not alpha is None:
             pointwise_membership.data = pointwise_membership.data**alpha        
         
-        pointwise_membership = normalize(pointwise_membership, norm = "l1")
+        if normalization.lower() == "l1":
+            pointwise_membership = normalize(pointwise_membership, norm = "l1")
+        elif normalization.lower() == "softmax":
+            pointwise_membership = softmax(pointwise_membership.A, axis = 1)
+            pointwise_membership = sparse.csr_matrix(pointwise_membership)
+        else:
+            raise ValueError(f"normalization should be one of ['l1', 'softmax'], got {normalization}")
+
         return pointwise_membership    
 
 
@@ -545,10 +553,7 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
         self.boosting_leaf_weight_strategy = boosting_leaf_weight_strategy
         return
     
-        
-    def __getattr__(self, attr):
-        return getattr(self.ensemble_estimator, attr)
-    
+            
     def _get_graph_clusterer(self, graph_cluster_method, leaf_biadjacency_matrix, n_archetypes, beta, **graph_clustering_kwargs):
         
         if not graph_clustering_kwargs:
@@ -617,7 +622,7 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
     def fit(self, X, y = None, sample_weight = None, **kwargs):
                 
         if isinstance(self.ensemble_estimator, LGBMModel):            
-            ensemble_estimator = LGBMTransformer(ensemble_estimator, leaf_weight_strategy = self.boosting_leaf_weight_strategy, prefit_estimator = self.prefit_ensemble)
+            ensemble_estimator = LGBMTransformer(self.ensemble_estimator, leaf_weight_strategy = self.boosting_leaf_weight_strategy, prefit_estimator = self.prefit_ensemble)
         
         elif isinstance(self.ensemble_estimator, BaseForest):
             ensemble_estimator = ForestTransformer(self.ensemble_estimator)
@@ -625,7 +630,7 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
             raise TypeError(f"for now, only lightgbm.LGBMModel or sklearn.ensemble._forest.BaseForest instances are accepted as ensemble estimator")
         
         #fit estimator
-        self.ensemble_estimator = deepcopy(ensemble_estimator)            
+        self.ensemble_estimator = clone(ensemble_estimator)            
         sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.ensemble_estimator, sample_weight, **kwargs)
         self.ensemble_estimator.fit(X=X, y=y, **{**kws, **sample_weights})                        
         
