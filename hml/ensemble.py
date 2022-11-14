@@ -434,36 +434,6 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
     def __getattr__(self, attr):
         return getattr(self.ensemble_estimator, attr)
     
-    def _get_leaf_biadjecency_matrix(self, X, beta, sample_weight):
-        
-        biadjecency_matrix = self.ensemble_estimator_.transform(X)                        
-        
-        if not beta is None:
-            biadjecency_matrix.data = biadjecency_matrix.data**beta
-        
-        if not sample_weight is None:
-            biadjecency_matrix = biadjecency_matrix.multiply(sample_weight.reshape(-1,1))
-            biadjecency_matrix = sparse.csr_matrix(biadjecency_matrix)
-        
-        return biadjecency_matrix
-    
-    def _get_archetype_membership(self, X, leaf_memberships, alpha):
-        
-        pointwise_membership = sparse_dot_product(X,
-                                                  leaf_memberships,
-                                                  ntop = None,
-                                                  lower_bound=0,
-                                                  use_threads=False,
-                                                  n_jobs=self.n_jobs,
-                                                  return_best_ntop=False,
-                                                  test_nnz_max=-1,
-                                                 )
-        
-        pointwise_membership.data = pointwise_membership.data**alpha        
-        pointwise_membership = normalize(pointwise_membership, norm = "l1")
-        
-        return pointwise_membership
-            
     
     def fit(self, X, y = None, sample_weight = None, **kwargs):
         
@@ -492,26 +462,15 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
                 ("ensemble_transformer", ensemble_estimator),
                 ("embedder", embedder_),
                 ("clusterer", clusterer_),
+                ("sparsifier", FunctionTransformer(sparse.csr_matrix))
             ]
         )
         
         sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(pipe, sample_weight, **kwargs)
         pipe.fit(X, y, **{**sample_weights, **kws})
-        #fit estimator
         
-        if not self.prefit_ensemble:            
-            self.ensemble_estimator_ = clone(ensemble_estimator)
-            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.ensemble_estimator_, sample_weight, **kwargs)            
-            self.ensemble_estimator_.fit(X=X, y=y, **{**kws, **sample_weights})            
-        else:
-            self.ensemble_estimator_ = deepcopy(ensemble_estimator)
-        
-        
-        
-        self.embedder_ = embedder_
-        self.clusterer_ = clusterer_
         self.ensemble_estimator_ = self.ensemble_estimator_
-        self.leaf_memberships_ = leaf_memberships
+        self.processing_pipe_ = pipe
         return self
         
     def transform(self, X, alpha = None):
@@ -519,8 +478,11 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         if alpha is None:
             alpha = self.alpha
         
-        X = self._get_leaf_biadjecency_matrix(X, beta=self.beta, sample_weight=None)
-        pointwise_membership = self._get_archetype_membership(X, self.leaf_memberships_, alpha)                    
+        pointwise_membership = pipe.transform(pointwise_membership)
+        if not alpha is None:
+            pointwise_membership.data = pointwise_membership.data**alpha        
+        
+        pointwise_membership = normalize(pointwise_membership, norm = "l1")
         return pointwise_membership    
 
 
