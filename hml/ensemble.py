@@ -1,5 +1,6 @@
 import inspect
 from copy import deepcopy
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -13,9 +14,12 @@ from sklearn.ensemble._forest import BaseForest
 
 from joblib import effective_n_jobs, Parallel, delayed
 
-from sknetwork.clustering import KMeans as GraphKMeans
-from sknetwork.clustering import PropagationClustering, Louvain
-
+try:
+    from sknetwork.clustering import KMeans as GraphKMeans
+    from sknetwork.clustering import PropagationClustering, Louvain
+except Exception as e:
+    warnings.warn(f"Failed do load sknetwork, some classes that depend upon it will raise errors: {e}")
+    
 from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor, LGBMModel
 
 from scipy import sparse
