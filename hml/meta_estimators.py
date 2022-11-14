@@ -9,7 +9,7 @@ from functools import reduce
 
 from scipy import sparse
 
-from .utils import _parse_pipeline_fit_kws, _parse_pipeline_fit_sample_weight
+from .utils import _parse_pipeline_fit_kws, _parse_pipeline_fit_sample_weight, _parse_pipeline_sample_weight_and_kwargs
 
 def _log_odds_ratio_scale(X):
     X = np.clip(X, 1e-8, 1 - 1e-8)   # numerical stability
@@ -91,7 +91,7 @@ class ResidualRegressor(BaseEstimator, RegressorMixin):
         self.residual_split_fraction = residual_split_fraction
         return
     
-    def fit(self,X, y = None, **kwargs):
+    def fit(self,X, y = None, sample_weight = None, **kwargs):
         
         if y.ndim == 1:
             y = y.reshape(-1,1)
@@ -101,7 +101,8 @@ class ResidualRegressor(BaseEstimator, RegressorMixin):
         
         estimator = self.regressors[0]
         if self.residual_split_fraction is None:         
-            estimator.fit(X=X, y=y, **kwargs)
+            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(estimator, sample_weight, **kwargs)            
+            estimator.fit(X=X, y=y, **{**kws, **sample_weights})
             self.regressors_.append(estimator)
             if len(self.regressors) == 1:
                 #end case
@@ -110,7 +111,8 @@ class ResidualRegressor(BaseEstimator, RegressorMixin):
                 self._fit_recursive(X=X, y=y, i = 1, **kwargs)
         else:
             X, Xres, y, yres = train_test_split(X, y, test_size = self.residual_split_fraction)
-            estimator.fit(X=X, y=y, **kwargs)
+            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(estimator, sample_weight, **kwargs)
+            estimator.fit(X=X, y=y, **{**kws, **sample_weights})
             self.regressors_.append(estimator)                       
             if len(self.regressors) == 1:
                 #end case
@@ -120,13 +122,14 @@ class ResidualRegressor(BaseEstimator, RegressorMixin):
                 
         return self
     
-    def _fit_recursive(self, X, y, i, **kwargs):
+    def _fit_recursive(self, X, y, i, sample_weight = None, **kwargs):
                         
         estimator = self.regressors[i]
 
         if self.residual_split_fraction is None:         
             res = y - self._infer(X, 'predict')
-            estimator.fit(X=X, y=res, **kwargs)
+            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(estimator, sample_weight, **kwargs)
+            estimator.fit(X=X, y=res, **{**kws, **sample_weights})
             self.regressors_.append(estimator)
             if i+1 >= len(self.regressors):
                 #end case
@@ -136,7 +139,8 @@ class ResidualRegressor(BaseEstimator, RegressorMixin):
         else:
             X, Xres, y, yres = train_test_split(X, y, test_size = self.residual_split_fraction)
             res = y - self._infer(X, 'predict')
-            estimator.fit(X=X, y=res, **kwargs)                     
+            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(estimator, sample_weight, **kwargs)
+            estimator.fit(X=X, y=res, **{**kws, **sample_weights})
             self.regressors_.append(estimator)            
             if i+1 >= len(self.regressors):
                 #end case
@@ -172,9 +176,9 @@ class ResidualClassifier(ResidualRegressor):
         self.residual_split_fraction = residual_split_fraction
         return
     
-    def fit(self, X, y = None, **kwargs):
-        self.regressors = [_CustomFuzzyTargetClassifier(clone(reg)) for reg in self.regressors]
-        super().fit(X = X, y = y, **kwargs)
+    def fit(self, X, y = None, sample_weight = None, **kwargs):
+        self.regressors = [_CustomFuzzyTargetClassifier(clone(reg)) for reg in self.regressors]        
+        super().fit(X = X, y = y, sample_weight = sample_weight, **kwargs)
         return self
     
     def decision_function(self, X):
@@ -241,7 +245,8 @@ class ArchetypeEnsembleClassifier(BaseEstimator):
         
         if not self.prefit_embedder:
             base_embedder = clone(self.base_embedder)
-            base_embedder.fit(X, y=y, sample_weight=sample_weight)
+            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(base_embedder, sample_weight, **kwargs)
+            base_embedder.fit(X, y=y, **{**sample_weights, **kws})
         else:
             base_embedder = self.base_embedder
             #base_embedder = clone(self.base_embedder)
@@ -268,12 +273,8 @@ class ArchetypeEnsembleClassifier(BaseEstimator):
                 
             else:
                 if not weights is None:
-                    if isinstance(estim, Pipeline):
-                        kwargs = _parse_pipeline_fit_kws(estim, **kwargs)
-                        sample_weights = _parse_pipeline_fit_sample_weight(estim, sample_weight)                
-                        estim.fit(X=X_sample, y=y_sample, **{**kwargs, **sample_weights})                        
-                    else:
-                        estim.fit(X=X_sample, y=y_sample, sample_weight=weights)
+                    sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(estim, sample_weight, **kwargs)
+                    estim.fit(X=X_sample, y=y_sample, **{**kws, **sample_weights})                    
                 else:
                     #to ensure will work with estimators that donnot accept sample_weight parameters in fit
                     estim.fit(X=X_sample, y=y_sample)
@@ -399,7 +400,8 @@ class ArchetypeEnsembleRegressor(BaseEstimator):
         
         if not self.prefit_embedder:
             base_embedder = clone(self.base_embedder)
-            base_embedder.fit(X, y=y, sample_weight=sample_weight)
+            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(base_embedder, sample_weight, **kwargs)
+            base_embedder.fit(X, y=y, **{**sample_weights, **kws})
         else:
             base_embedder = self.base_embedder
             #base_embedder = clone(self.base_embedder)
@@ -421,13 +423,9 @@ class ArchetypeEnsembleRegressor(BaseEstimator):
                 use_membership_weights = self.use_membership_weights
             )
             
-            if not weights is None:
-                if isinstance(estim, Pipeline):
-                    kwargs = _parse_pipeline_fit_kws(estim, **kwargs)
-                    sample_weights = _parse_pipeline_fit_sample_weight(estim, sample_weight)                
-                    estim.fit(X=X_sample, y=y_sample, **{**kwargs, **sample_weights})                        
-                else:
-                    estim.fit(X=X_sample, y=y_sample, sample_weight=weights)
+            if not weights is None:                
+                weights, kws = _parse_pipeline_sample_weight_and_kwargs(estim, weights, **kwargs)                    
+                estim.fit(X=X_sample, y=y_sample, **{**kws, **weights})                
             else:
                 #to ensure will work with estimators that donnot accept sample_weight parameters in fit
                 estim.fit(X=X_sample, y=y_sample)

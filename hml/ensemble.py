@@ -1,4 +1,5 @@
 import inspect
+from copy import deepcopy
 
 import numpy as np
 import pandas as pd
@@ -30,10 +31,21 @@ from .utils import _parse_pipeline_fit_kws, _parse_pipeline_fit_sample_weight, _
 #lgbm custom estimators
 
 
-class _LeafWeightedLGBM():
+class LGBMTransformer():
     """
     Same as LGBMClassifier, but contaions the apply method and leaf weights are leaerned as well
     """
+    def __init__(self, lgbm_estimator, leaf_weight_strategy = "cumulative_unit_gain", prefit_estimator = False):
+        """
+        A transformer that returns the weighted leaf space of a sample
+        """
+        self.lgbm_estimator = lgbm_estimator
+        self.leaf_weight_strategy = leaf_weight_strategy
+        self.prefit_estimator = prefit_estimator
+    
+    def __getattr__(self,attr):
+        return getattr(self.lgbm_estimator, attr)
+    
     def apply(self, X):
         
         """
@@ -55,7 +67,7 @@ class _LeafWeightedLGBM():
         leafs = self.apply(X)
         return self._transform_decision_path(leafs)
     
-    def fit(self, X, y = None, sample_weight = None, leaf_weights_strategy = "cumulative_unit_gain", **kwargs):
+    def fit(self, X, y = None, sample_weight = None, prefit_ensemble = False, **kwargs):
         
         """
         fits estimators and learns leaf weights according to leaf_weigjts_strategy.
@@ -73,7 +85,7 @@ class _LeafWeightedLGBM():
         sample_weight: Array like of shape (n_samples,)
             Weights of each sample 
         
-        leaf_weights_strategy: str or None
+        leaf_weight_strategy: str or None
             How to determine leaf weights. Can be one of ["cumulative_gain","cumulative_unit_gain", "count", None].
             
             cumulative_gain:
@@ -92,9 +104,15 @@ class _LeafWeightedLGBM():
             keyword arguments passed to LGBMClassifier.fit method
             
         """        
-        super().fit(X, y=y, sample_weight=sample_weight, **kwargs)                
         
-        self._set_leaf_weights(leaf_weights_strategy)
+        if not self.prefit_estimator:            
+            self.lgbm_estimator = clone(lgbm_estimator)
+            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.lgbm_estimator, sample_weight, **kwargs)            
+            self.lgbm_estimator.fit(X=X, y=y, **{**kws, **sample_weights})            
+        else:
+            self.lgbm_estimator = deepcopy(self.lgbm_estimator)
+        
+        self._set_leaf_weights(self.leaf_weight_strategy)
         self.encoder_ = OneHotEncoder().fit(self.apply(X))
         return self
     
@@ -164,15 +182,6 @@ class _LeafWeightedLGBM():
 
     
     
-class LGBMClassificationTransformer(_LeafWeightedLGBM, LGBMClassifier):
-    pass
-
-class LGBMRankingTransformer(_LeafWeightedLGBM, LGBMRanker):
-    pass
-
-class LGBMRegressionTransformer(_LeafWeightedLGBM, LGBMRegressor):
-    pass
-
 
 ##############################################
 ### using leafs as indexes for a NN search ###
@@ -400,7 +409,7 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         ensemble_estimator,        
         embedder = GaussianRandomProjection(50),
         clusterer = MiniBatchKMeans(10),
-        boosting_leaf_weights_strategy = "cumulative_unit_gain",
+        boosting_leaf_weight_strategy = "cumulative_unit_gain",
         alpha = 1,
         beta = 1,  
         fuzzy_membership = False,
@@ -418,7 +427,7 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         self.n_jobs = n_jobs
 
         self.prefit_ensemble = prefit_ensemble
-        self.boosting_leaf_weights_strategy = boosting_leaf_weights_strategy
+        self.boosting_leaf_weight_strategy = boosting_leaf_weight_strategy
         return
     
         
@@ -469,51 +478,35 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         #set ensemble transformers
         #if sklearn forest
         #if lgbm
-        if isinstance(self.ensemble_estimator, LGBMClassifier):            
-            ensemble_estimator = LGBMClassificationTransformer(**self.ensemble_estimator.get_params())
-            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
-        
-        elif isinstance(self.ensemble_estimator, LGBMRegressor):            
-            ensemble_estimator = LGBMRegressionTransformer(**self.ensemble_estimator.get_params())
-            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
-        
-        elif isinstance(self.ensemble_estimator, LGBMRanker):            
-            ensemble_estimator = LGBMRankingTransformer(**self.ensemble_estimator.get_params())
-            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
+        if isinstance(self.ensemble_estimator, LGBMModel):            
+            ensemble_estimator = LGBMTransformer(ensemble_estimator, leaf_weight_strategy = self.boosting_leaf_weight_strategy, prefit_estimator = self.prefit_ensemble)  
         
         elif isinstance(self.ensemble_estimator, BaseForest):
-            ensemble_estimator = _ForestTransformer(self.ensemble_estimator)
+            ensemble_estimator = ForestTransformer(self.ensemble_estimator)
         else:
             raise TypeError(f"for now, only lightgbm.LGBMModel or sklearn.ensemble._forest.BaseForest instances are accepted as ensemble estimator")
         
+        ## processing pipeline
+        pipe = Pipeline(
+            [
+                ("ensemble_transformer", ensemble_estimator),
+                ("embedder", embedder_),
+                ("clusterer", clusterer_),
+            ]
+        )
+        
+        sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(pipe, sample_weight, **kwargs)
+        pipe.fit(X, y, **{**sample_weights, **kws})
         #fit estimator
-        self.ensemble_estimator_ = clone(ensemble_estimator)
+        
         if not self.prefit_ensemble:            
+            self.ensemble_estimator_ = clone(ensemble_estimator)
             sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.ensemble_estimator_, sample_weight, **kwargs)            
             self.ensemble_estimator_.fit(X=X, y=y, **{**kws, **sample_weights})            
         else:
-            pass
+            self.ensemble_estimator_ = deepcopy(ensemble_estimator)
         
-        #fit one hot encoders of the nodes        
-        leaf_adjacency_matrix = self._get_leaf_biadjecency_matrix(X, self.beta, sample_weight)
-        #find graph comunities        
-        instance_embs = embedder_.fit_transform(leaf_adjacency_matrix)
-        clusterer_.fit(instance_embs)
-        instance_clusters = clusterer_.predict(instance_embs)        
-        instance_memberships = OneHotEncoder().fit_transform(instance_clusters.reshape(-1,1))           
-
         
-        leaf_memberships = sparse_dot_product(leaf_adjacency_matrix.T,
-                                              instance_memberships,
-                                              ntop = None,
-                                              lower_bound=0,
-                                              use_threads=False,
-                                              n_jobs=self.n_jobs,
-                                              return_best_ntop=False,
-                                              test_nnz_max=-1,
-                                             )
-        
-        leaf_memberships = normalize(leaf_memberships, norm = "l1")
         
         self.embedder_ = embedder_
         self.clusterer_ = clusterer_
@@ -530,144 +523,25 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         pointwise_membership = self._get_archetype_membership(X, self.leaf_memberships_, alpha)                    
         return pointwise_membership    
 
-class ClusterArchetypeEncoder2(BaseEstimator, TransformerMixin):
-    
-    def __init__(
-        self,
-        ensemble_estimator,        
-        leaf_embedder,
-        leaf_clusterer,
-        boosting_leaf_weights_strategy = "cumulative_unit_gain",
-        alpha = 1,
-        beta = 1,  
-        use_leaf_weights = False,
-        fuzzy_membership = False,
-        prefit_ensemble = False,
-        n_jobs = None,
-
-    ):
-        
-        self.ensemble_estimator = ensemble_estimator
-        self.leaf_embedder = leaf_embedder
-        self.leaf_clusterer = leaf_clusterer
-        self.alpha = alpha
-        self.beta = beta                
-        self.fuzzy_membership = fuzzy_membership
-        self.n_jobs = n_jobs
-
-        self.use_leaf_weights = use_leaf_weights
-        self.prefit_ensemble = prefit_ensemble
-        self.boosting_leaf_weights_strategy = boosting_leaf_weights_strategy
-        return
-    
-        
-    def __getattr__(self, attr):
-        return getattr(self.ensemble_estimator, attr)
-    
-    def _get_leaf_biadjecency_matrix(self, X, beta, sample_weight):
-        
-        biadjecency_matrix = self.ensemble_estimator_.transform(X)                        
-        
-        if not beta is None:
-            biadjecency_matrix.data = biadjecency_matrix.data**beta
-        
-        if not sample_weight is None:
-            biadjecency_matrix = biadjecency_matrix.multiply(sample_weight.reshape(-1,1))
-            biadjecency_matrix = sparse.csr_matrix(biadjecency_matrix)
-        
-        return biadjecency_matrix
-    
-    def _get_archetype_membership(self, X, leaf_memberships, alpha):
-        
-        pointwise_membership = sparse_dot_product(X,
-                                                  leaf_memberships,
-                                                  ntop = None,
-                                                  lower_bound=0,
-                                                  use_threads=False,
-                                                  n_jobs=self.n_jobs,
-                                                  return_best_ntop=False,
-                                                  test_nnz_max=-1,
-                                                 )
-        
-        pointwise_membership.data = pointwise_membership.data**alpha        
-        pointwise_membership = normalize(pointwise_membership, norm = "l1")
-        
-        return pointwise_membership
-            
-    
-    def fit(self, X, y = None, sample_weight = None, **kwargs):
-        
-        # set estimators
-        if not self.leaf_embedder is None:            
-            leaf_embeder_ = clone(self.leaf_embedder)
-        else:
-            leaf_embeder_ = FunctionTransformer()
-        
-        leaf_clusterer_ = clone(self.leaf_clusterer)
-        
-        #set ensemble transformers
-        #if sklearn forest
-        #if lgbm
-        if isinstance(self.ensemble_estimator, LGBMClassifier):            
-            ensemble_estimator = LGBMClassificationTransformer(**self.ensemble_estimator.get_params())
-            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
-        
-        elif isinstance(self.ensemble_estimator, LGBMRegressor):            
-            ensemble_estimator = LGBMRegressionTransformer(**self.ensemble_estimator.get_params())
-            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
-        
-        elif isinstance(self.ensemble_estimator, LGBMRanker):            
-            ensemble_estimator = LGBMRankingTransformer(**self.ensemble_estimator.get_params())
-            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
-        
-        elif isinstance(self.ensemble_estimator, BaseForest):
-            ensemble_estimator = _ForestTransformer(self.ensemble_estimator)
-        else:
-            raise TypeError(f"for now, only lightgbm.LGBMModel or sklearn.ensemble._forest.BaseForest instances are accepted as ensemble estimator")
-        
-        #fit estimator
-        self.ensemble_estimator_ = clone(ensemble_estimator)
-        if not self.prefit_ensemble:            
-            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.ensemble_estimator_, sample_weight, **kwargs)            
-            self.ensemble_estimator_.fit(X=X, y=y, **{**kws, **sample_weights})            
-        else:
-            pass
-        
-        #fit one hot encoders of the nodes        
-        leaf_adjacency_matrix = self._get_leaf_biadjecency_matrix(X, self.beta, sample_weight)
-        #find graph comunities        
-        leaf_embs = leaf_embeder_.fit_transform(leaf_adjacency_matrix.T)
-        leaf_clusterer_.fit(leaf_embs)
-        leaf_clusters = leaf_clusterer_.predict(leaf_embs)        
-        leaf_memberships = OneHotEncoder().fit_transform(leaf_clusters.reshape(-1,1))                
-
-        self.leaf_embeder_ = leaf_embeder_
-        self.leaf_clusterer_ = leaf_clusterer_
-        self.ensemble_estimator_ = self.ensemble_estimator_
-        self.leaf_memberships_ = leaf_memberships
-        return self
-        
-    def transform(self, X, alpha = None):
-        
-        if alpha is None:
-            alpha = self.alpha
-        
-        X = self._get_leaf_biadjecency_matrix(X, beta=self.beta, sample_weight=None)
-        pointwise_membership = self._get_archetype_membership(X, self.leaf_memberships_, alpha)                    
-        return pointwise_membership    
 
 
-class _ForestTransformer(BaseEstimator, TransformerMixin):
+class ForestTransformer(BaseEstimator, TransformerMixin):
     
-    def __init__(self, forest):
+    def __init__(self, forest, prefit_estimator = False):
         self.forest = forest
+        self.prefit_estimator = prefit_estimator
         return
         
     def __getattr__(self, attr):
         return getattr(self.forest, attr)
     
     def fit(self, X, y = None, sample_weight = None, **kwargs):
-        self.forest.fit(X, y = y, sample_weight = sample_weight, **kwargs)
+        if self.prefit_estimator:
+            self.forest = deepcopy(self.forest)
+        else:
+            self.forest = clone(self.forest)
+            self.forest.fit(X, y = y, sample_weight = sample_weight, **kwargs)
+        
         leafs = self.forest.apply(X)
         self.leafs_onehotencoder_ = OneHotEncoder().fit(leafs)
         return self                
@@ -686,7 +560,7 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
         n_archetypes = 100,
         alpha = 1,
         beta = 1,
-        boosting_leaf_weights_strategy = "cumulative_information_gain",
+        boosting_leaf_weight_strategy = "cumulative_information_gain",
         graph_cluster_method = "kmeans",
         use_leaf_weights = False,
         fuzzy_membership = False,
@@ -706,7 +580,7 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
         self.use_leaf_weights = use_leaf_weights
         self.prefit_ensemble = prefit_ensemble
         self.graph_cluster_method = graph_cluster_method
-        self.boosting_leaf_weights_strategy = boosting_leaf_weights_strategy
+        self.boosting_leaf_weight_strategy = boosting_leaf_weight_strategy
         return
     
         
@@ -780,30 +654,18 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
     
     def fit(self, X, y = None, sample_weight = None, **kwargs):
                 
-        if isinstance(self.ensemble_estimator, LGBMClassifier):            
-            ensemble_estimator = LGBMClassificationTransformer(**self.ensemble_estimator.get_params())
-            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
-        
-        elif isinstance(self.ensemble_estimator, LGBMRegressor):            
-            ensemble_estimator = LGBMRegressionTransformer(**self.ensemble_estimator.get_params())
-            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
-        
-        elif isinstance(self.ensemble_estimator, LGBMRanker):            
-            ensemble_estimator = LGBMRankingTransformer(**self.ensemble_estimator.get_params())
-            kwargs["leaf_weights_strategy"] = self.boosting_leaf_weights_strategy
+        if isinstance(self.ensemble_estimator, LGBMModel):            
+            ensemble_estimator = LGBMTransformer(ensemble_estimator, leaf_weight_strategy = self.boosting_leaf_weight_strategy, prefit_estimator = self.prefit_ensemble)
         
         elif isinstance(self.ensemble_estimator, BaseForest):
-            ensemble_estimator = _ForestTransformer(self.ensemble_estimator)
+            ensemble_estimator = ForestTransformer(self.ensemble_estimator)
         else:
             raise TypeError(f"for now, only lightgbm.LGBMModel or sklearn.ensemble._forest.BaseForest instances are accepted as ensemble estimator")
         
-        #fit estimator        
-        if not self.prefit_ensemble:
-            self.ensemble_estimator = clone(self.ensemble_estimator)            
-            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.ensemble_estimator, sample_weight, **kwargs)
-            self.ensemble_estimator.fit(X=X, y=y, **{**kws, **sample_weights})                        
-        else:
-            pass
+        #fit estimator
+        self.ensemble_estimator = deepcopy(ensemble_estimator)            
+        sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.ensemble_estimator, sample_weight, **kwargs)
+        self.ensemble_estimator.fit(X=X, y=y, **{**kws, **sample_weights})                        
         
         # gets terminal nodes
         terminal_leafs = self.ensemble_estimator.apply(X)
