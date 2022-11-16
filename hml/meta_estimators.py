@@ -1,8 +1,11 @@
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, clone
 from sklearn.utils.validation import check_array
+from sklearn.preprocessing import normalize
 from sklearn.pipeline import Pipeline
 from scipy.special import softmax
 import numpy as np
+
+from copy import deepcopy
 
 from sklearn.model_selection import train_test_split
 from functools import reduce
@@ -212,7 +215,14 @@ class _SingleLabelClassifier(BaseEstimator):
     
     def predict_proba(self, X):
         return np.ones((X.shape[0], 1))
+    
+    
+    
+#####################################################
+################# Archetypes ########################
+#####################################################
 
+        
 class ArchetypeEnsembleClassifier(BaseEstimator):
     def __init__(
         self,
@@ -248,11 +258,14 @@ class ArchetypeEnsembleClassifier(BaseEstimator):
             sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(base_embedder, sample_weight, **kwargs)
             base_embedder.fit(X, y=y, **{**sample_weights, **kws})
         else:
-            base_embedder = self.base_embedder
+            base_embedder = deepcopy(self.base_embedder)
             #base_embedder = clone(self.base_embedder)
-                
-        memberships = base_embedder.transform(X)
-        if not (np.isclose(memberships.sum(axis = 1), 1)).all():
+        self.base_embedder_ = base_embedder
+        
+        memberships = self.base_embedder_.transform(X)
+        
+        memberships = normalize(memberships, "l1")
+        if not (np.isclose(memberships.sum(axis = 1).A.flatten(), 1, atol=1e-6)).all():
             raise ValueError(f"Some membership rows do not sum up to 1")
         
         n_archetypes = memberships.shape[-1]
@@ -284,7 +297,6 @@ class ArchetypeEnsembleClassifier(BaseEstimator):
         #save states
         self.classes_ = np.unique(y)
         self.archetype_estimator_list_ = archetype_estimator_list
-        self.base_embedder_ = base_embedder
         self.n_archetypes_ = n_archetypes
         return self
     

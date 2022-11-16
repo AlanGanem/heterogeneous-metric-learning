@@ -35,20 +35,23 @@ from .utils import _parse_pipeline_fit_kws, _parse_pipeline_fit_sample_weight, _
 #lgbm custom estimators
 
 
-class LGBMTransformer():
+class LGBMTransformer(BaseEstimator, TransformerMixin):
     """
     Same as LGBMClassifier, but contaions the apply method and leaf weights are leaerned as well
     """
-    def __init__(self, lgbm_estimator, leaf_weight_strategy = "cumulative_unit_gain", prefit_estimator = False):
+    def __init__(self, lgbm_estimator, leaf_weight_strategy = "cumulative_unit_gain", prefit_ensemble = False):
         """
         A transformer that returns the weighted leaf space of a sample
         """
         self.lgbm_estimator = lgbm_estimator
         self.leaf_weight_strategy = leaf_weight_strategy
-        self.prefit_estimator = prefit_estimator
+        self.prefit_ensemble = prefit_ensemble
     
     def __getattr__(self,attr):
-        return getattr(self.lgbm_estimator, attr)
+        if attr != "lgbm_estimator_":
+            return getattr(self.lgbm_estimator_, attr)
+        else:
+            raise AttributeError(f"{self} has no attribute {attr}")
     
     def apply(self, X):
         
@@ -109,12 +112,12 @@ class LGBMTransformer():
             
         """        
         
-        if not self.prefit_estimator:            
-            self.lgbm_estimator = clone(self.lgbm_estimator)
-            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.lgbm_estimator, sample_weight, **kwargs)            
-            self.lgbm_estimator.fit(X=X, y=y, **{**kws, **sample_weights})            
+        if not self.prefit_ensemble:            
+            self.lgbm_estimator_ = clone(self.lgbm_estimator)
+            sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.lgbm_estimator_, sample_weight, **kwargs)            
+            self.lgbm_estimator_.fit(X=X, y=y, **{**kws, **sample_weights})            
         else:
-            self.lgbm_estimator = deepcopy(self.lgbm_estimator)
+            self.lgbm_estimator_ = deepcopy(self.lgbm_estimator)
         
         self._set_leaf_weights(self.leaf_weight_strategy)
         self.encoder_ = OneHotEncoder().fit(self.apply(X))
@@ -134,7 +137,7 @@ class LGBMTransformer():
             #do not assign leaf_weights_ attribute
             return
         else:    
-            model_df = self.booster_.trees_to_dataframe()
+            model_df = self.lgbm_estimator_.booster_.trees_to_dataframe()
 
             d_cols = ["split_gain","parent_index","node_index","count"]
             parent_split_gain = pd.merge(model_df[d_cols], model_df[d_cols], left_on = "parent_index", right_on = "node_index", how = "left")
@@ -191,6 +194,7 @@ class LGBMTransformer():
 ### using leafs as indexes for a NN search ###
 ##############################################
 
+#TODO: Make Forest Neighbors work with LGBM and wieghted leafs
 
 class ForestNeighbors(BaseEstimator):
     
@@ -405,17 +409,21 @@ def _postprocess_node_points(points, n_neighbors, sample_size):
 ##############################################
 ###    Archetype encoding and embedding    ###
 ##############################################
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
 class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
     
     def __init__(
         self,
         ensemble_estimator,        
-        embedder = GaussianRandomProjection(50),
+        embedder = GaussianRandomProjection(10),
         clusterer = MiniBatchKMeans(10),
-        boosting_leaf_weight_strategy = "cumulative_unit_gain",
+        cluster_probabilistic_estimator = LinearDiscriminantAnalysis(),
+        boosting_leaf_weight_strategy = "cumulative_unit_gain", 
         alpha = 1,
         beta = 1,  
+        max_cumulative_membership = None,
+        topn_archetypes = None,
         normalization = "l1",
         fuzzy_membership = False,
         prefit_ensemble = False,
@@ -426,11 +434,14 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         self.ensemble_estimator = ensemble_estimator
         self.embedder = embedder
         self.clusterer = clusterer
+        self.cluster_probabilistic_estimator = cluster_probabilistic_estimator
         self.alpha = alpha
         self.beta = beta                
         self.fuzzy_membership = fuzzy_membership
         self.n_jobs = n_jobs
         self.normalization = normalization
+        self.topn_archetypes=topn_archetypes
+        self.max_cumulative_membership=max_cumulative_membership
 
         self.prefit_ensemble = prefit_ensemble
         self.boosting_leaf_weight_strategy = boosting_leaf_weight_strategy
@@ -451,10 +462,10 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         #if sklearn forest
         #if lgbm
         if isinstance(self.ensemble_estimator, LGBMModel):            
-            ensemble_estimator = LGBMTransformer(self.ensemble_estimator, leaf_weight_strategy = self.boosting_leaf_weight_strategy, prefit_estimator = self.prefit_ensemble)  
+            ensemble_estimator = LGBMTransformer(self.ensemble_estimator, leaf_weight_strategy = self.boosting_leaf_weight_strategy, prefit_ensemble = self.prefit_ensemble)  
         
         elif isinstance(self.ensemble_estimator, BaseForest):
-            ensemble_estimator = ForestTransformer(self.ensemble_estimator)
+            ensemble_estimator = ForestTransformer(self.ensemble_estimator, prefit_estimator = self.prefit_ensemble)
         else:
             raise TypeError(f"for now, only lightgbm.LGBMModel or sklearn.ensemble._forest.BaseForest instances are accepted as ensemble estimator")
         
@@ -463,54 +474,102 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
             [
                 ("ensemble_transformer", ensemble_estimator),
                 ("embedder", embedder_),
-                ("clusterer", clusterer_),                
-                ("sparsifier", FunctionTransformer(sparse.csr_matrix)),
+                ("clusterer", clusterer_),  
+                ("distance_scaler", FunctionTransformer(lambda x: sparse.csr_matrix(normalize(np.clip(1/x, 0, np.finfo(np.float32).max), "l1"))))
             ]
         )
+        
         
         sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(pipe, sample_weight, **kwargs)
         pipe.fit(X, y, **{**sample_weights, **kws})
         
+#         emb_space = pipe[:-1].transform(X)
+#         clusters = pipe[-1].predict(emb_space)
+#         cluster_probabilistic_estimator = clone(self.cluster_probabilistic_estimator)
+        
+#         cluster_probabilistic_estimator.fit(emb_space, clusters)
+        
+#         self.cluster_probabilistic_estimator_ = cluster_probabilistic_estimator
         self.ensemble_estimator_ = pipe.named_steps["ensemble_transformer"]
         self.processing_pipe_ = pipe
         return self
         
-    def transform(self, X, alpha = None, normalization=None):
+    def transform(self, X, alpha = None, normalization=None, topn_archetypes=None, max_cumulative_membership=None):
         
         if alpha is None:
             alpha = self.alpha
         if normalization is None:
             normalization = self.normalization
         
+        if max_cumulative_membership is None:
+            max_cumulative_membership = self.max_cumulative_membership
+        
+        if topn_archetypes is None:
+            topn_archetypes = self.topn_archetypes
+        
+        
         pointwise_membership = self.processing_pipe_.transform(X)
-        pointwise_membership.data = 1/pointwise_membership.data        
+        # emb_space = self.processing_pipe_[:-1].transform(X)
+        # pointwise_membership = self.cluster_probabilistic_estimator_.predict_proba(emb_space)
+        # pointwise_membership = sparse.csr_matrix(pointwise_membership)
+        
         if not alpha is None:
             pointwise_membership.data = pointwise_membership.data**alpha        
+                        
         
-        if normalization.lower() == "l1":
-            pointwise_membership = normalize(pointwise_membership, norm = "l1")
-        elif normalization.lower() == "softmax":
-            pointwise_membership = softmax(pointwise_membership.A, axis = 1)
-            pointwise_membership = sparse.csr_matrix(pointwise_membership)
-        else:
-            raise ValueError(f"normalization should be one of ['l1', 'softmax'], got {normalization}")
+        if any([max_cumulative_membership, topn_archetypes]):
+            
+            pointwise_membership = pointwise_membership.A                                    
+            
+            argsort = np.argsort(pointwise_membership, axis = 1)                        
+            #TODO: decide how to handle when both max_cumulative_membership and topn_archetypes are not None
+            if not max_cumulative_membership is None:
+                #indexes of flattened array
+                flat_argsort = (argsort + np.arange(argsort.shape[0]).reshape(-1,1)*argsort.shape[1]).flatten()                
 
+                #cumsum of normalized
+                cumsum_xt = np.cumsum(
+                    pointwise_membership.flatten()[flat_argsort].reshape(pointwise_membership.shape), # flatten and reshape in order to order array
+                    axis = 1) #
+
+                zeros_idxs_msk = cumsum_xt < 1 - max_cumulative_membership #check columns that sum up to the complemetary of max_cumulative_membership
+                flat_zeros_idxs = flat_argsort[zeros_idxs_msk.flatten()]
+            else:
+                #bottom_n
+                zeros_idxs = argsort[:,:-topn_archetypes]
+                flat_zeros_idxs = (zeros_idxs + np.arange(argsort.shape[0]).reshape(-1,1)*argsort.shape[1]).flatten()
+
+            #replace values using put            
+            pointwise_membership.put(flat_zeros_idxs, 0)
+            
+            pointwise_membership = sparse.csr_matrix(pointwise_membership)
+        
+        
+            # if normalization.lower() == "l1":
+            #     pointwise_membership = normalize(pointwise_membership, norm = "l1")
+            # elif normalization.lower() == "softmax":
+            #     pointwise_membership = softmax(pointwise_membership.A, axis = 1)
+            #     pointwise_membership = sparse.csr_matrix(pointwise_membership)
+            # else:
+            #     raise ValueError(f"normalization should be one of ['l1', 'softmax'], got {normalization}")
+        
+        pointwise_membership = normalize(pointwise_membership, norm = "l1")
         return pointwise_membership    
 
 
 
 class ForestTransformer(BaseEstimator, TransformerMixin):
     
-    def __init__(self, forest, prefit_estimator = False):
+    def __init__(self, forest, prefit_ensemble = False):
         self.forest = forest
-        self.prefit_estimator = prefit_estimator
+        self.prefit_ensemble = prefit_ensemble
         return
         
     def __getattr__(self, attr):
         return getattr(self.forest, attr)
     
     def fit(self, X, y = None, sample_weight = None, **kwargs):
-        if self.prefit_estimator:
+        if self.prefit_ensemble:
             self.forest = deepcopy(self.forest)
         else:
             self.forest = clone(self.forest)
@@ -534,7 +593,9 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
         n_archetypes = 100,
         alpha = 1,
         beta = 1,
-        boosting_leaf_weight_strategy = "cumulative_information_gain",
+        topn_archetypes=None,
+        max_cumulative_membership=False,
+        boosting_leaf_weight_strategy = "cumulative_gain",
         graph_cluster_method = "kmeans",
         use_leaf_weights = False,
         fuzzy_membership = False,
@@ -548,6 +609,8 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
         self.n_archetypes = n_archetypes
         self.alpha = alpha
         self.beta = beta                
+        self.topn_archetypes = topn_archetypes
+        self.max_cumulative_membership = max_cumulative_membership
         self.fuzzy_membership = fuzzy_membership
         self.n_jobs = n_jobs
         self.graph_clustering_kwargs = graph_clustering_kwargs 
@@ -584,14 +647,14 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
     
     def _get_leaf_biadjecency_matrix(self, X, beta, sample_weight):
         
-        terminal_nodes = self.ensemble_estimator.apply(X)        
+        terminal_nodes = self.ensemble_estimator_.apply(X)        
         #gets biadjecency matrix
         biadjecency_matrix = self.one_hot_leaf_encoder_.transform(terminal_nodes)
 
         
         if self.use_leaf_weights:
-            if hasattr(self.ensemble_estimator, "leaf_weights_"):
-                biadjecency_matrix = biadjecency_matrix.multiply(self.ensemble_estimator.leaf_weights_)
+            if hasattr(self.ensemble_estimator_, "leaf_weights_"):
+                biadjecency_matrix = biadjecency_matrix.multiply(self.ensemble_estimator_.leaf_weights_)
                 biadjecency_matrix = sparse.csr_matrix(biadjecency_matrix)
             else:
                 raise AttributeError("ensemble_estimator should contain leaf_weights_ attribute error in order to properly use use_leaf_weights")
@@ -626,20 +689,20 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
     def fit(self, X, y = None, sample_weight = None, **kwargs):
                 
         if isinstance(self.ensemble_estimator, LGBMModel):            
-            ensemble_estimator = LGBMTransformer(self.ensemble_estimator, leaf_weight_strategy = self.boosting_leaf_weight_strategy, prefit_estimator = self.prefit_ensemble)
+            ensemble_estimator = LGBMTransformer(self.ensemble_estimator, leaf_weight_strategy = self.boosting_leaf_weight_strategy, prefit_ensemble = self.prefit_ensemble)
         
         elif isinstance(self.ensemble_estimator, BaseForest):
-            ensemble_estimator = ForestTransformer(self.ensemble_estimator)
+            ensemble_estimator = ForestTransformer(self.ensemble_estimator, prefit_ensemble=self.prefit_ensemble)
         else:
             raise TypeError(f"for now, only lightgbm.LGBMModel or sklearn.ensemble._forest.BaseForest instances are accepted as ensemble estimator")
         
         #fit estimator
-        self.ensemble_estimator = clone(ensemble_estimator)            
-        sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.ensemble_estimator, sample_weight, **kwargs)
-        self.ensemble_estimator.fit(X=X, y=y, **{**kws, **sample_weights})                        
-        
+        self.ensemble_estimator_ = deepcopy(ensemble_estimator)            
+        sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.ensemble_estimator_, sample_weight, **kwargs)
+        self.ensemble_estimator_.fit(X=X, y=y, **{**kws, **sample_weights})                        
+
         # gets terminal nodes
-        terminal_leafs = self.ensemble_estimator.apply(X)
+        terminal_leafs = self.ensemble_estimator_.apply(X)
         #fit one hot encoders of the nodes        
         self.one_hot_leaf_encoder_ = OneHotEncoder().fit(terminal_leafs)
         del terminal_leafs
@@ -675,15 +738,59 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
         self.leaf_memberships_ = leaf_memberships
         return self
         
-    def transform(self, X, alpha = None):
+    
+    def transform(self, X, alpha = None, topn_archetypes=None, max_cumulative_membership=None):
+        
         
         if alpha is None:
             alpha = self.alpha
         
+        if max_cumulative_membership is None:
+            max_cumulative_membership = self.max_cumulative_membership
+        
+        if topn_archetypes is None:
+            topn_archetypes = self.topn_archetypes
+        
+        
+        
         X = self._get_leaf_biadjecency_matrix(X, beta=self.beta, sample_weight=None)
         pointwise_membership = self._get_archetype_membership(X, self.leaf_memberships_, alpha)                    
-        return pointwise_membership    
+        
+        if not alpha is None:
+            pointwise_membership.data = pointwise_membership.data**alpha        
+                        
+        
+        if any([max_cumulative_membership, topn_archetypes]):
+            
+            pointwise_membership = pointwise_membership.A                                    
+            
+            argsort = np.argsort(pointwise_membership, axis = 1)                      
+            #TODO: decide how to handle when both max_cumulative_membership and topn_archetypes are not None
+            if not max_cumulative_membership is None:
+                #indexes of flattened array
+                flat_argsort = (argsort + np.arange(argsort.shape[0]).reshape(-1,1)*argsort.shape[1]).flatten()                
 
+                #cumsum of normalized
+                cumsum_xt = np.cumsum(
+                    pointwise_membership.flatten()[flat_argsort].reshape(pointwise_membership.shape), # flatten and reshape in order to order array
+                    axis = 1) #
+
+                zeros_idxs_msk = cumsum_xt < 1 - max_cumulative_membership #check columns that sum up to the complemetary of max_cumulative_membership
+                flat_zeros_idxs = flat_argsort[zeros_idxs_msk.flatten()]
+            else:
+                #bottom_n
+                zeros_idxs = argsort[:,:-topn_archetypes]
+                flat_zeros_idxs = (zeros_idxs + np.arange(argsort.shape[0]).reshape(-1,1)*argsort.shape[1]).flatten()
+
+            #replace values using put            
+            pointwise_membership.put(flat_zeros_idxs, 0)
+            pointwise_membership = sparse.csr_matrix(pointwise_membership)
+        
+        
+
+        pointwise_membership = normalize(pointwise_membership, norm = "l1")
+        
+        return pointwise_membership    
     
 
     
