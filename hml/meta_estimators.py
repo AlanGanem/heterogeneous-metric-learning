@@ -230,7 +230,7 @@ class ArchetypeEnsembleClassifier(BaseEstimator):
         final_transformer,
         prefit_embedder = False,
         use_membership_weights = True,
-        transform_method = "predict_proba"
+        transform_method = "transform"
     ):
         
         """
@@ -370,7 +370,7 @@ class ArchetypeEnsembleClassifier(BaseEstimator):
         return X
     
     
-    def transform(self, X):
+    def transform(self, X, **kwargs):
         X = self._infer_reduce(self.transform_method, X, **kwargs)
         return X
     

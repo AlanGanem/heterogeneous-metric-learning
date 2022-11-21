@@ -418,7 +418,7 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         ensemble_estimator,        
         embedder = GaussianRandomProjection(10),
         clusterer = MiniBatchKMeans(10),
-        cluster_probabilistic_estimator = LinearDiscriminantAnalysis(),
+        #cluster_probabilistic_estimator = LinearDiscriminantAnalysis(),
         boosting_leaf_weight_strategy = "cumulative_unit_gain", 
         alpha = 1,
         beta = 1,  
@@ -434,7 +434,7 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         self.ensemble_estimator = ensemble_estimator
         self.embedder = embedder
         self.clusterer = clusterer
-        self.cluster_probabilistic_estimator = cluster_probabilistic_estimator
+        #self.cluster_probabilistic_estimator = cluster_probabilistic_estimator
         self.alpha = alpha
         self.beta = beta                
         self.fuzzy_membership = fuzzy_membership
@@ -465,7 +465,7 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
             ensemble_estimator = LGBMTransformer(self.ensemble_estimator, leaf_weight_strategy = self.boosting_leaf_weight_strategy, prefit_ensemble = self.prefit_ensemble)  
         
         elif isinstance(self.ensemble_estimator, BaseForest):
-            ensemble_estimator = ForestTransformer(self.ensemble_estimator, prefit_estimator = self.prefit_ensemble)
+            ensemble_estimator = ForestTransformer(self.ensemble_estimator, prefit_ensemble = self.prefit_ensemble)
         else:
             raise TypeError(f"for now, only lightgbm.LGBMModel or sklearn.ensemble._forest.BaseForest instances are accepted as ensemble estimator")
         
