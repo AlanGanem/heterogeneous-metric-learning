@@ -32,6 +32,9 @@ from umap import UMAP
 from .utils import hstack, sparse_dot_product
 from .utils import _parse_pipeline_fit_kws, _parse_pipeline_fit_sample_weight, _parse_pipeline_sample_weight_and_kwargs
 
+# from utils import hstack, sparse_dot_product
+# from utils import _parse_pipeline_fit_kws, _parse_pipeline_fit_sample_weight, _parse_pipeline_sample_weight_and_kwargs
+
 #lgbm custom estimators
 
 
@@ -418,6 +421,7 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         ensemble_estimator,        
         embedder = GaussianRandomProjection(10),
         clusterer = MiniBatchKMeans(10),
+        fuzzy_membership = True,
         #cluster_probabilistic_estimator = LinearDiscriminantAnalysis(),
         boosting_leaf_weight_strategy = "cumulative_unit_gain", 
         alpha = 1,
@@ -425,7 +429,6 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         max_cumulative_membership = None,
         topn_archetypes = None,
         normalization = "l1",
-        fuzzy_membership = False,
         prefit_ensemble = False,
         n_jobs = None,
 
@@ -458,6 +461,7 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         
         clusterer_ = clone(self.clusterer)
         
+        self.n_jobs_ = effective_n_jobs(self.n_jobs)
         #set ensemble transformers
         #if sklearn forest
         #if lgbm
@@ -474,8 +478,10 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
             [
                 ("ensemble_transformer", ensemble_estimator),
                 ("embedder", embedder_),
-                ("clusterer", clusterer_),  
-                ("distance_scaler", FunctionTransformer(lambda x: sparse.csr_matrix(normalize(np.clip(1/x, 0, np.finfo(np.float32).max), "l1"))))
+                ("clusterer", clusterer_),
+                ("selector", FunctionTransformer(lambda x: x.argmin(1).reshape(-1,1))),
+                #("distance_scaler", FunctionTransformer(lambda x: sparse.csr_matrix(normalize(np.clip(1/x**2, 0, np.finfo(np.float32).max), "l1"))))
+                ("onehotencoder", OneHotEncoder())
             ]
         )
         
@@ -483,14 +489,26 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(pipe, sample_weight, **kwargs)
         pipe.fit(X, y, **{**sample_weights, **kws})
         
-#         emb_space = pipe[:-1].transform(X)
-#         clusters = pipe[-1].predict(emb_space)
-#         cluster_probabilistic_estimator = clone(self.cluster_probabilistic_estimator)
-        
-#         cluster_probabilistic_estimator.fit(emb_space, clusters)
-        
-#         self.cluster_probabilistic_estimator_ = cluster_probabilistic_estimator
         self.ensemble_estimator_ = pipe.named_steps["ensemble_transformer"]
+        
+        if self.fuzzy_membership:
+            #find average cluster emmbership of each leaf node to further inference
+            leaf_nodes = self.ensemble_estimator_.transform(X)
+            point_memberships = pipe.transform(X)        
+            leaf_memberships  = sparse_dot_product(leaf_nodes.T,
+                                      point_memberships,
+                                      ntop = self.topn_archetypes,
+                                      lower_bound=0,
+                                      use_threads= self.n_jobs_ > 1,
+                                      n_jobs=self.n_jobs_,
+                                      return_best_ntop=False,
+                                      test_nnz_max=-1,
+                                     )
+        
+            self.leaf_memberships_ = leaf_memberships
+        else:
+            self.leaf_memberships_ = None
+            
         self.processing_pipe_ = pipe
         return self
         
@@ -508,7 +526,19 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
             topn_archetypes = self.topn_archetypes
         
         
-        pointwise_membership = self.processing_pipe_.transform(X)
+        if not self.fuzzy_membership:
+            pointwise_membership = self.processing_pipe_.transform(X)
+        else:
+            leaf_nodes = self.ensemble_estimator_.transform(X)
+            pointwise_membership  = sparse_dot_product(leaf_nodes,
+                                      self.leaf_memberships_,
+                                      ntop = self.topn_archetypes,
+                                      lower_bound=0,
+                                      use_threads= self.n_jobs_ > 1,
+                                      n_jobs=self.n_jobs_,
+                                      return_best_ntop=False,
+                                      test_nnz_max=-1,
+                                     )         
         # emb_space = self.processing_pipe_[:-1].transform(X)
         # pointwise_membership = self.cluster_probabilistic_estimator_.predict_proba(emb_space)
         # pointwise_membership = sparse.csr_matrix(pointwise_membership)
@@ -542,16 +572,7 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
             #replace values using put            
             pointwise_membership.put(flat_zeros_idxs, 0)
             
-            pointwise_membership = sparse.csr_matrix(pointwise_membership)
-        
-        
-            # if normalization.lower() == "l1":
-            #     pointwise_membership = normalize(pointwise_membership, norm = "l1")
-            # elif normalization.lower() == "softmax":
-            #     pointwise_membership = softmax(pointwise_membership.A, axis = 1)
-            #     pointwise_membership = sparse.csr_matrix(pointwise_membership)
-            # else:
-            #     raise ValueError(f"normalization should be one of ['l1', 'softmax'], got {normalization}")
+            pointwise_membership = sparse.csr_matrix(pointwise_membership)                
         
         pointwise_membership = normalize(pointwise_membership, norm = "l1")
         return pointwise_membership    
@@ -597,11 +618,13 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
         max_cumulative_membership=False,
         boosting_leaf_weight_strategy = "cumulative_gain",
         graph_cluster_method = "kmeans",
-        use_leaf_weights = False,
+        use_leaf_weights = True,
         fuzzy_membership = False,
         prefit_ensemble = False,
+        bipartite_adjacency = True,
+        n_neighbors = 30,
         n_jobs = None,
-        **graph_clustering_kwargs,
+        graph_clustering_kwargs = {},
 
     ):
         
@@ -616,8 +639,22 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
         self.graph_clustering_kwargs = graph_clustering_kwargs 
         self.use_leaf_weights = use_leaf_weights
         self.prefit_ensemble = prefit_ensemble
+        self.bipartite_adjacency = bipartite_adjacency
         self.graph_cluster_method = graph_cluster_method
         self.boosting_leaf_weight_strategy = boosting_leaf_weight_strategy
+        self.n_neighbors = n_neighbors
+        
+#         # fix to karteclub Error when clone due to API imcompatibility
+#         if not isinstance(self.graph_cluster_method, str):
+#             #factory to solve karateclub compatibility with sklearn API, making it inherit from BaseEstimator
+#             def karate_club_factory(kc_instance):
+#                 class CustomKarateClub(BaseEstimator, kc_instance.__class__):
+#                     pass
+
+#                 new_kc_instance = CustomKarateClub(**kc_instance.get_params())
+#                 return new_kc_instance
+            
+#         self.graph_cluster_method = karate_club_factory(self.graph_cluster_method)
         return
     
             
@@ -629,20 +666,75 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
         if graph_cluster_method is None:
             graph_cluster_method = self.graph_cluster_method
         
-        if graph_cluster_method == 'louvain':
-            method = Louvain(**graph_clustering_kwargs)
+        if isinstance(graph_cluster_method, str):
+            is_karateclub = False
+            if graph_cluster_method == 'louvain': 
+                method = Louvain(**graph_clustering_kwargs)
+
+            elif graph_cluster_method == 'kmeans':
+                method = GraphKMeans(self.n_archetypes, **graph_clustering_kwargs)
+
+            elif graph_cluster_method == 'propagation':
+                method = PropagationClustering(**graph_clustering_kwargs)
+
+            else:
+                raise ValueError(f'Suported methods are: ["louvain","propagation", "kmeans"], {graph_cluster_method} was passed.')
+        else:
+            is_karateclub = True
+            method = graph_cluster_method
         
-        elif graph_cluster_method == 'kmeans':
-            method = GraphKMeans(self.n_archetypes, **graph_clustering_kwargs)
-        
-        elif graph_cluster_method == 'propagation':
-            method = PropagationClustering(**graph_clustering_kwargs)
+        if self.bipartite_adjacency:                        
+            
+            if not isinstance(graph_cluster_method, str):
+                raise ValueError(f'Suported methods for bipartite adjacency are: ["louvain","propagation", "kmeans"], {graph_cluster_method} was passed.')
+                
+            graph_embedder = method.fit(leaf_biadjacency_matrix)
+            membership_row_, membership_col_ = graph_embedder.membership_row_, graph_embedder.membership_col_
         
         else:
-            raise ValueError(f'Suported methods are: ["louvain","propagation", "kmeans"], {graph_cluster_method} was passed.')
-        
-        graph_embedder = method.fit(leaf_biadjacency_matrix)
-        return graph_embedder
+            
+            adjacency = sparse_dot_product(leaf_biadjacency_matrix,
+                                  leaf_biadjacency_matrix.T,
+                                  ntop = self.n_neighbors,
+                                  lower_bound=0,
+                                  use_threads= self.n_jobs_ > 1,
+                                  n_jobs=self.n_jobs_,
+                                  return_best_ntop=False,
+                                  test_nnz_max=-1,
+                                 )
+            
+            adjacency = normalize(adjacency, "l2")
+            adjacency = sparse.triu(adjacency, 1)
+            # import seaborn as sns
+            # print(sns.distplot(adjacency.data))
+            
+            if not is_karateclub:
+                graph_embedder = method.fit(adjacency)
+                membership_row_ = graph_embedder.membership_
+            else:
+                                
+                #karateclub requires a graph instead of a adjacency matrix as input
+                
+                graph_embedder = method
+                graph_embedder.fit(nx.from_scipy_sparse_matrix(adjacency))
+                memberships = np.array(list(graph_embedder.get_memberships().values()))
+                if len(memberships.shape) == 1:
+                    memberships = memberships.reshape(-1,1)
+                membership_row_ = OneHotEncoder().fit_transform(memberships)
+                                    
+            
+            membership_col_ = sparse_dot_product(leaf_biadjacency_matrix.T,
+                                  membership_row_,
+                                  ntop = None,
+                                  lower_bound=0,
+                                  use_threads= self.n_jobs_ > 1,
+                                  n_jobs=self.n_jobs_,
+                                  return_best_ntop=False,
+                                  test_nnz_max=-1,
+                                 )
+            
+        membership_row_, membership_col_  = normalize(membership_row_, "l1"), normalize(membership_col_, "l1") 
+        return membership_row_, membership_col_ 
     
     
     def _get_leaf_biadjecency_matrix(self, X, beta, sample_weight):
@@ -657,7 +749,9 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
                 biadjecency_matrix = biadjecency_matrix.multiply(self.ensemble_estimator_.leaf_weights_)
                 biadjecency_matrix = sparse.csr_matrix(biadjecency_matrix)
             else:
-                raise AttributeError("ensemble_estimator should contain leaf_weights_ attribute error in order to properly use use_leaf_weights")
+                warnings.warn("ensemble_estimator should contain leaf_weights_ attribute error in order to properly use use_leaf_weights")
+                pass
+                
         
         if not beta is None:
             biadjecency_matrix.data = biadjecency_matrix.data**beta
@@ -674,8 +768,8 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
                                                   leaf_memberships,
                                                   ntop = None,
                                                   lower_bound=0,
-                                                  use_threads=False,
-                                                  n_jobs=self.n_jobs,
+                                                  use_threads= self.n_jobs_ > 1,
+                                                  n_jobs=self.n_jobs_,
                                                   return_best_ntop=False,
                                                   test_nnz_max=-1,
                                                  )
@@ -694,8 +788,9 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
         elif isinstance(self.ensemble_estimator, BaseForest):
             ensemble_estimator = ForestTransformer(self.ensemble_estimator, prefit_ensemble=self.prefit_ensemble)
         else:
-            raise TypeError(f"for now, only lightgbm.LGBMModel or sklearn.ensemble._forest.BaseForest instances are accepted as ensemble estimator")
+            raise TypeError(f"for now, only lightgbm.LGBMModel or sklearn.ensemble._forest.BaseForest instances are accepted as ensemble estimator")                
         
+        self.n_jobs_ = effective_n_jobs(self.n_jobs)
         #fit estimator
         self.ensemble_estimator_ = deepcopy(ensemble_estimator)            
         sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(self.ensemble_estimator_, sample_weight, **kwargs)
@@ -710,7 +805,7 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
         X = self._get_leaf_biadjecency_matrix(X, self.beta, sample_weight)
         #find graph comunities
         
-        com_detector = self._get_graph_clusterer(graph_cluster_method=self.graph_cluster_method,
+        membership_row_, membership_col_ = self._get_graph_clusterer(graph_cluster_method=self.graph_cluster_method,
                                                  leaf_biadjacency_matrix=X,
                                                  n_archetypes=self.n_archetypes,
                                                  beta=self.beta,
@@ -720,21 +815,20 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
         if self.fuzzy_membership:
             #gets the membership as the aerage of the point membership that falls into that leaf
             leaf_memberships = sparse_dot_product(X.T,
-                                                  com_detector.membership_row_,
+                                                  membership_row_,
                                                   ntop = None,
                                                   lower_bound=0,
-                                                  use_threads=False,
-                                                  n_jobs=self.n_jobs,
+                                                  use_threads= self.n_jobs_ > 1,
+                                                  n_jobs=self.n_jobs_,
                                                   return_best_ntop=False,
                                                   test_nnz_max=-1,
                                                  )
             
             leaf_memberships = normalize(leaf_memberships, "l1")
         else:
-            leaf_memberships = com_detector.membership_col_
+            leaf_memberships = membership_col_
 
         
-        self.graph_clusterer_ = com_detector
         self.leaf_memberships_ = leaf_memberships
         return self
         
@@ -1336,8 +1430,8 @@ class GraphArchetypeUMAP(BaseEstimator, TransformerMixin):
                                                       leaf_memberships,
                                                       ntop = None,
                                                       lower_bound=0,
-                                                      use_threads=False,
-                                                      n_jobs=self.n_jobs,
+                                                      use_threads= self.n_jobs_ > 1,
+                                                      n_jobs=self.n_jobs_,
                                                       return_best_ntop=False,
                                                       test_nnz_max=-1,
                                                      )
@@ -1369,7 +1463,7 @@ class GraphArchetypeUMAP(BaseEstimator, TransformerMixin):
         return net_embs
     
     def fit(self, X, y = None, sample_weight = None):
-        
+        self.n_jobs_ = effective_n_jobs(self.n_jobs)
         if not self.input_archetype_membership:        
             X = sparse.csr_matrix(X)
             #find graph comunities
@@ -1385,8 +1479,8 @@ class GraphArchetypeUMAP(BaseEstimator, TransformerMixin):
                                                       com_detector.membership_row_,
                                                       ntop = None,
                                                       lower_bound=0,
-                                                      use_threads=False,
-                                                      n_jobs=self.n_jobs,
+                                                      use_threads= self.n_jobs_ > 1,
+                                                      n_jobs=self.n_jobs_,
                                                       return_best_ntop=False,
                                                       test_nnz_max=-1,
                                                      )
@@ -1433,8 +1527,8 @@ class GraphArchetypeUMAP(BaseEstimator, TransformerMixin):
                                   self.network_embeddings_,
                                   ntop = None,
                                   lower_bound=0,
-                                  use_threads=False,
-                                  n_jobs=self.n_jobs,
+                                  use_threads= self.n_jobs_ > 1,
+                                  n_jobs=self.n_jobs_,
                                   return_best_ntop=False,
                                   test_nnz_max=-1,
                                  )
@@ -1493,8 +1587,8 @@ class ClusterArchetypeUMAP(BaseEstimator, TransformerMixin):
                                                   instance_memberships,
                                                   ntop = None,
                                                   lower_bound=0,
-                                                  use_threads=False,
-                                                  n_jobs=self.n_jobs,
+                                                  use_threads= self.n_jobs_ > 1,
+                                                  n_jobs=self.n_jobs_,
                                                   return_best_ntop=False,
                                                   test_nnz_max=-1,
                                                  )
@@ -1504,8 +1598,8 @@ class ClusterArchetypeUMAP(BaseEstimator, TransformerMixin):
                                               instance_memberships,
                                               ntop = None,
                                               lower_bound=0,
-                                              use_threads=False,
-                                              n_jobs=self.n_jobs,
+                                              use_threads= self.n_jobs_ > 1,
+                                              n_jobs=self.n_jobs_,
                                               return_best_ntop=False,
                                               test_nnz_max=-1,
                                              )
@@ -1522,8 +1616,8 @@ class ClusterArchetypeUMAP(BaseEstimator, TransformerMixin):
                                                       leaf_memberships,
                                                       ntop = None,
                                                       lower_bound=0,
-                                                      use_threads=False,
-                                                      n_jobs=self.n_jobs,
+                                                      use_threads= self.n_jobs_ > 1,
+                                                      n_jobs=self.n_jobs_,
                                                       return_best_ntop=False,
                                                       test_nnz_max=-1,
                                                      )
@@ -1572,8 +1666,8 @@ class ClusterArchetypeUMAP(BaseEstimator, TransformerMixin):
                                                       instance_memberships,
                                                       ntop = None,
                                                       lower_bound=0,
-                                                      use_threads=False,
-                                                      n_jobs=self.n_jobs,
+                                                      use_threads= self.n_jobs_ > 1,
+                                                      n_jobs=self.n_jobs_,
                                                       return_best_ntop=False,
                                                       test_nnz_max=-1,
                                                      )
@@ -1620,8 +1714,8 @@ class ClusterArchetypeUMAP(BaseEstimator, TransformerMixin):
                                   self.network_embeddings_,
                                   ntop = None,
                                   lower_bound=0,
-                                  use_threads=False,
-                                  n_jobs=self.n_jobs,
+                                  use_threads= self.n_jobs_ > 1,
+                                  n_jobs=self.n_jobs_,
                                   return_best_ntop=False,
                                   test_nnz_max=-1,
                                  )

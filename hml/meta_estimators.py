@@ -254,7 +254,9 @@ class ArchetypeEnsembleClassifier(BaseEstimator):
     def fit(self, X, y = None, sample_weight = None, **kwargs):
         
         if not self.prefit_embedder:
-            base_embedder = clone(self.base_embedder)
+            #hotfix for karateclub incompatibility
+            #base_embedder = clone(self.base_embedder)
+            base_embedder = self.base_embedder
             sample_weights, kws = _parse_pipeline_sample_weight_and_kwargs(base_embedder, sample_weight, **kwargs)
             base_embedder.fit(X, y=y, **{**sample_weights, **kws})
         else:
