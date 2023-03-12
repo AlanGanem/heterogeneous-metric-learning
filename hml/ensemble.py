@@ -419,10 +419,12 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
     def __init__(
         self,
         ensemble_estimator,        
-        embedder = GaussianRandomProjection(10),
+        embedder = GaussianRandomProjection(100),
         clusterer = MiniBatchKMeans(10),
-        fuzzy_membership = True,
-        #cluster_probabilistic_estimator = LinearDiscriminantAnalysis(),
+        membership_estimator = FunctionTransformer(lambda x: np.exp(-x**2)),
+        use_embedding_space_on_memership_estimation = False,
+        use_leaf_memberships = True,        
+        membership_estimator_method = "transform",
         boosting_leaf_weight_strategy = "cumulative_unit_gain", 
         alpha = 1,
         beta = 1,  
@@ -440,11 +442,14 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         #self.cluster_probabilistic_estimator = cluster_probabilistic_estimator
         self.alpha = alpha
         self.beta = beta                
-        self.fuzzy_membership = fuzzy_membership
+        self.use_leaf_memberships = use_leaf_memberships
         self.n_jobs = n_jobs
         self.normalization = normalization
         self.topn_archetypes=topn_archetypes
         self.max_cumulative_membership=max_cumulative_membership
+        self.membership_estimator = membership_estimator
+        self.use_embedding_space_on_memership_estimation = use_embedding_space_on_memership_estimation
+        self.membership_estimator_method = membership_estimator_method
 
         self.prefit_ensemble = prefit_ensemble
         self.boosting_leaf_weight_strategy = boosting_leaf_weight_strategy
@@ -473,15 +478,21 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         else:
             raise TypeError(f"for now, only lightgbm.LGBMModel or sklearn.ensemble._forest.BaseForest instances are accepted as ensemble estimator")
         
+        if self.membership_estimator is None:
+            self.membership_estimator_ = OneHotEncoder()
+        else:
+            self.membership_estimator_ = clone(self.membership_estimator)
+        
         ## processing pipeline
         pipe = Pipeline(
             [
                 ("ensemble_transformer", ensemble_estimator),
                 ("embedder", embedder_),
                 ("clusterer", clusterer_),
-                ("selector", FunctionTransformer(lambda x: x.argmin(1).reshape(-1,1))),
+                #("selector", FunctionTransformer(lambda x: x.argmin(1).reshape(-1,1))),
                 #("distance_scaler", FunctionTransformer(lambda x: sparse.csr_matrix(normalize(np.clip(1/x**2, 0, np.finfo(np.float32).max), "l1"))))
-                ("onehotencoder", OneHotEncoder())
+                #("onehotencoder", OneHotEncoder())
+                #("sparsifier", FunctionTransformer(lambda x: sparse.csr_matrix(x)))
             ]
         )
         
@@ -491,10 +502,24 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         
         self.ensemble_estimator_ = pipe.named_steps["ensemble_transformer"]
         
-        if self.fuzzy_membership:
-            #find average cluster emmbership of each leaf node to further inference
-            leaf_nodes = self.ensemble_estimator_.transform(X)
-            point_memberships = pipe.transform(X)        
+        # fit membership_estimator
+        leaf_nodes = self.ensemble_estimator_.transform(X)
+        centroid_distances = pipe.transform(X)
+        clusters = centroid_distances.argmin(1).reshape(-1,1)
+        
+        if self.use_embedding_space_on_memership_estimation:
+            centroid_distances = pipe[1].transform(pipe[0].transform(X))
+
+        if not self.membership_estimator is None:
+            
+            self.membership_estimator_.fit(centroid_distances, clusters)
+            point_memberships = getattr(self.membership_estimator_, self.membership_estimator_method)(centroid_distances)
+            point_memberships = sparse.csr_matrix(point_memberships)
+        else:
+            point_memberships = self.membership_estimator_.fit_transform(clusters)
+        
+        if self.use_leaf_memberships:
+            #find average cluster emmbership of each leaf node to further inference            
             leaf_memberships  = sparse_dot_product(leaf_nodes.T,
                                       point_memberships,
                                       ntop = self.topn_archetypes,
@@ -504,7 +529,9 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
                                       return_best_ntop=False,
                                       test_nnz_max=-1,
                                      )
-        
+            
+            leaf_memberships = normalize(leaf_memberships, "l1")
+            
             self.leaf_memberships_ = leaf_memberships
         else:
             self.leaf_memberships_ = None
@@ -526,8 +553,19 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
             topn_archetypes = self.topn_archetypes
         
         
-        if not self.fuzzy_membership:
-            pointwise_membership = self.processing_pipe_.transform(X)
+        if not self.use_leaf_memberships:
+            
+            if self.use_embedding_space_on_memership_estimation:
+                centroid_distances = self.processing_pipe_[1].transform(self.processing_pipe_[0].transform(X))
+            else:
+                centroid_distances = self.processing_pipe_.transform(X)
+            
+            if not self.membership_estimator is None:                
+                pointwise_membership = getattr(self.membership_estimator_, self.membership_estimator_method)(centroid_distances)
+                pointwise_membership = sparse.csr_matrix(pointwise_membership)
+            else:
+                clusters = centroid_distances.argmin(1).reshape(-1,1)
+                pointwise_membership = getattr(self.membership_estimator_, "transform")(clusters)
         else:
             leaf_nodes = self.ensemble_estimator_.transform(X)
             pointwise_membership  = sparse_dot_product(leaf_nodes,
@@ -606,18 +644,21 @@ class ForestTransformer(BaseEstimator, TransformerMixin):
         return X
     
 
+    
+from sklearn.cluster import FeatureAgglomeration
+
 class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
     
     def __init__(
         self,
         ensemble_estimator,        
-        n_archetypes = 100,
+        n_archetypes = None,
+        graph_cluster_method = "louvain",
         alpha = 1,
         beta = 1,
         topn_archetypes=None,
         max_cumulative_membership=False,
-        boosting_leaf_weight_strategy = "cumulative_gain",
-        graph_cluster_method = "kmeans",
+        boosting_leaf_weight_strategy = "cumulative_unit_gain",
         use_leaf_weights = True,
         fuzzy_membership = False,
         prefit_ensemble = False,
@@ -811,7 +852,7 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
                                                  beta=self.beta,
                                                  **self.graph_clustering_kwargs
                                                 )
-        #
+        #   
         if self.fuzzy_membership:
             #gets the membership as the aerage of the point membership that falls into that leaf
             leaf_memberships = sparse_dot_product(X.T,
