@@ -276,3 +276,4 @@ class CBHML(TransformerMixin, BaseEstimator):
     def predict_proba(self, X, **kwargs):
         return self._infer(X, inference_type = 'predict_proba', **kwargs)
     
+    

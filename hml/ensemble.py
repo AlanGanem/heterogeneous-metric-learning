@@ -10,7 +10,9 @@ from sklearn.pipeline import make_pipeline, Pipeline
 from sklearn.base import TransformerMixin, BaseEstimator, clone
 from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.random_projection import GaussianRandomProjection
+from sklearn.decomposition import TruncatedSVD
 from sklearn.ensemble._forest import BaseForest
+from sklearn.linear_model import LogisticRegression
 
 from joblib import effective_n_jobs, Parallel, delayed
 
@@ -132,7 +134,7 @@ class LGBMTransformer(BaseEstimator, TransformerMixin):
         sets leaf_weights_ attribute according to strategy
         """
         
-        VALID_STRATEGIES = ["cumulative_gain","cumulative_unit_gain", "count", None]
+        VALID_STRATEGIES = ["cumulative_gain","cumulative_unit_gain","cumulative_weight", "count", None]
         if not strategy in VALID_STRATEGIES:
             raise ValueError(f"strategy should be one of {VALID_STRATEGIES}, got {strategy}")
         
@@ -140,54 +142,56 @@ class LGBMTransformer(BaseEstimator, TransformerMixin):
             #do not assign leaf_weights_ attribute
             return
         else:    
-            model_df = self.lgbm_estimator_.booster_.trees_to_dataframe()
+            model_df = self.lgbm_estimator_.booster_.trees_to_dataframe().assign(node_tree_index=lambda d: d["node_index"].str.split("-").str[-1].str[1:].astype(int))            
+            self.leaf_weights_ =  (model_df.sort_values(by=["tree_index","node_tree_index"])[lambda d: d["right_child"].isna()]["weight"].values.reshape(1,-1))
+#             d_cols = ["split_gain","parent_index","node_index","count"]
+#             parent_split_gain = pd.merge(model_df[d_cols], model_df[d_cols], left_on = "parent_index", right_on = "node_index", how = "left")
 
-            d_cols = ["split_gain","parent_index","node_index","count"]
-            parent_split_gain = pd.merge(model_df[d_cols], model_df[d_cols], left_on = "parent_index", right_on = "node_index", how = "left")
+#             root_nodes = model_df[model_df["parent_index"].isna()][["tree_index","node_index"]].rename(columns={"node_index":"root_node"})
+#             model_df = model_df.merge(root_nodes, how = "left", on = "tree_index")
 
-            root_nodes = model_df[model_df["parent_index"].isna()][["tree_index","node_index"]].rename(columns={"node_index":"root_node"})
-            model_df = model_df.merge(root_nodes, how = "left", on = "tree_index")
-
-            model_df["parent_gain"] = parent_split_gain["split_gain_y"]
-            model_df["parent_count"] = parent_split_gain["count_y"]
-            model_df["parent_fraction"] = model_df["count"]/model_df["parent_count"]            
+#             model_df["parent_gain"] = parent_split_gain["split_gain_y"]
+#             model_df["parent_count"] = parent_split_gain["count_y"]
+#             model_df["parent_fraction"] = model_df["count"]/model_df["parent_count"]            
             
-            model_df["cumulative_gain"] = model_df["parent_gain"]#*model_df["parent_fraction"]
-            model_df["cumulative_gain"] = model_df["cumulative_gain"].fillna(0)
+#             model_df["cumulative_gain"] = model_df["parent_gain"]#*model_df["parent_fraction"]
+#             model_df["cumulative_gain"] = model_df["cumulative_gain"].fillna(0)
             
-            model_df["cumulative_unit_gain"] = model_df["cumulative_gain"]/model_df["count"]
-            model_df["cumulative_unit_gain"] = model_df["cumulative_unit_gain"].fillna(0)
+#             model_df["cumulative_unit_gain"] = model_df["cumulative_gain"]/model_df["count"]
+#             model_df["cumulative_unit_gain"] = model_df["cumulative_unit_gain"].fillna(0)
 
-            model_df["inverse_count"] = 1/model_df["count"]
-            model_df["unit_weight"] = model_df["weight"]/model_df["count"]
+#             model_df["inverse_count"] = 1/model_df["count"]
+#             model_df["unit_weight"] = model_df["weight"]/model_df["count"]
+#             model_df["cumulative_weight"] = model_df["weight"]
 
-            model_df["leaf_index"] = model_df["node_index"].str.split("-").str[1].str[1:].astype(int)
-            model_df["leaf_index"] = np.where(model_df["right_child"].isna(), model_df["leaf_index"], None)
+#             model_df["leaf_index"] = model_df["node_index"].str.split("-").str[1].str[1:].astype(int)
+#             model_df["leaf_index"] = np.where(model_df["right_child"].isna(), model_df["leaf_index"], None)
 
-            #path_indpr = np.hstack([[0], model_df.reset_index().groupby("tree_index")["index"].max().values])
-            leaf_indexes = model_df.dropna(subset = ["leaf_index"]).sort_values(by = ["tree_index", "leaf_index"]).index.values
-            leaf_index_map = model_df.dropna(subset = ["leaf_index"]).sort_values(by = ["tree_index", "leaf_index"])["node_index"]
-            path_pairs_df = model_df.dropna(subset = ["leaf_index"])[["root_node","node_index"]]
+#             #path_indpr = np.hstack([[0], model_df.reset_index().groupby("tree_index")["index"].max().values])
+#             leaf_indexes = model_df.dropna(subset = ["leaf_index"]).sort_values(by = ["tree_index", "leaf_index"]).index.values
+#             leaf_index_map = model_df.dropna(subset = ["leaf_index"]).sort_values(by = ["tree_index", "leaf_index"])["node_index"]
+#             path_pairs_df = model_df.dropna(subset = ["leaf_index"])[["root_node","node_index"]]
 
 
 
-            g = nx.Graph()
-            g.add_nodes_from(model_df["node_index"])
+#             g = nx.Graph()
+#             g.add_nodes_from(model_df["node_index"])
 
-            z = list(tuple(i) for i in tuple(model_df[["parent_index","node_index"]].dropna().values))
-            g.add_edges_from(z)
+#             z = list(tuple(i) for i in tuple(model_df[["parent_index","node_index"]].dropna().values))
+#             g.add_edges_from(z)
 
-            #strategy = "unit_parent_gain"
-            path_pairs = list(tuple(i) for i in tuple(path_pairs_df.values))
-            paths = np.array([np.array(nx.shortest_path(g, *i)) for i in path_pairs])
+#             #strategy = "unit_parent_gain"
+#             path_pairs = list(tuple(i) for i in tuple(path_pairs_df.values))
+#             paths = np.array([np.array(nx.shortest_path(g, *i)) for i in path_pairs])
 
-            weights_df = model_df.set_index("node_index")[[strategy, "tree_index", "node_depth"]]
-            weights_df["network_weight"] = np.nan
-            for i in np.arange(len(path_pairs_df["node_index"])):
-                weights_df.loc[path_pairs_df.loc[path_pairs_df.index[i],"node_index"], "network_weight"] = weights_df.loc[paths[i], strategy].sum()
+#             weights_df = model_df.set_index("node_index")[[strategy, "tree_index", "node_depth"]]
+#             weights_df["network_weight"] = np.nan
+#             for i in np.arange(len(path_pairs_df["node_index"])):
+#                 weights_df.loc[path_pairs_df.loc[path_pairs_df.index[i],"node_index"], "network_weight"] = weights_df.loc[paths[i], strategy].sum()
         
-            leaf_weights = weights_df.loc[leaf_index_map, "network_weight"].values.reshape(1,-1)
-            self.leaf_weights_ = leaf_weights
+#             leaf_weights = weights_df.loc[leaf_index_map, "network_weight"].values.reshape(1,-1)
+                        
+#             self.leaf_weights_ = leaf_weights
         return
 
     
@@ -419,13 +423,13 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
     def __init__(
         self,
         ensemble_estimator,        
-        embedder = GaussianRandomProjection(100),
-        clusterer = MiniBatchKMeans(10),
-        membership_estimator = FunctionTransformer(lambda x: np.exp(-x**2)),
+        embedder = TruncatedSVD(10),
+        clusterer = make_pipeline(FunctionTransformer(normalize), KMeans(10)),
+        membership_estimator = LogisticRegression(),
         use_embedding_space_on_memership_estimation = False,
-        use_leaf_memberships = True,        
-        membership_estimator_method = "transform",
-        boosting_leaf_weight_strategy = "cumulative_unit_gain", 
+        use_leaf_memberships = True,
+        membership_estimator_method = "auto",
+        boosting_leaf_weight_strategy = None, 
         alpha = 1,
         beta = 1,  
         max_cumulative_membership = None,
@@ -483,6 +487,17 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         else:
             self.membership_estimator_ = clone(self.membership_estimator)
         
+        if self.membership_estimator_method == "auto":
+            methods_hierarchy = ["predict_proba", "decision_function", "predict", "transform"]
+            for m in methods_hierarchy:
+                if hasattr(self.membership_estimator_, m):
+                    self.membership_estimator_method_ = m
+                    break
+                if m == methods_hierarchy[-1]:
+                    raise AttributeError(f"{self.membership_estimator_.__class__.__name__} has none of these attributes {methods_hierarchy}")
+        else:
+            self.membership_estimator_method_ = self.membership_estimator_method
+                    
         ## processing pipeline
         pipe = Pipeline(
             [
@@ -513,7 +528,7 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
         if not self.membership_estimator is None:
             
             self.membership_estimator_.fit(centroid_distances, clusters)
-            point_memberships = getattr(self.membership_estimator_, self.membership_estimator_method)(centroid_distances)
+            point_memberships = getattr(self.membership_estimator_, self.membership_estimator_method_)(centroid_distances)
             point_memberships = sparse.csr_matrix(point_memberships)
         else:
             point_memberships = self.membership_estimator_.fit_transform(clusters)
@@ -561,7 +576,7 @@ class ClusterArchetypeEncoder(BaseEstimator, TransformerMixin):
                 centroid_distances = self.processing_pipe_.transform(X)
             
             if not self.membership_estimator is None:                
-                pointwise_membership = getattr(self.membership_estimator_, self.membership_estimator_method)(centroid_distances)
+                pointwise_membership = getattr(self.membership_estimator_, self.membership_estimator_method_)(centroid_distances)
                 pointwise_membership = sparse.csr_matrix(pointwise_membership)
             else:
                 clusters = centroid_distances.argmin(1).reshape(-1,1)
@@ -645,6 +660,7 @@ class ForestTransformer(BaseEstimator, TransformerMixin):
     
 
     
+
 from sklearn.cluster import FeatureAgglomeration
 
 class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
@@ -652,7 +668,7 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
     def __init__(
         self,
         ensemble_estimator,        
-        n_archetypes = None,
+        max_archetypes = None,
         graph_cluster_method = "louvain",
         alpha = 1,
         beta = 1,
@@ -670,7 +686,7 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
     ):
         
         self.ensemble_estimator = ensemble_estimator
-        self.n_archetypes = n_archetypes
+        self.max_archetypes = max_archetypes
         self.alpha = alpha
         self.beta = beta                
         self.topn_archetypes = topn_archetypes
@@ -713,7 +729,7 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
                 method = Louvain(**graph_clustering_kwargs)
 
             elif graph_cluster_method == 'kmeans':
-                method = GraphKMeans(self.n_archetypes, **graph_clustering_kwargs)
+                method = GraphKMeans(self.max_archetypes, **graph_clustering_kwargs)
 
             elif graph_cluster_method == 'propagation':
                 method = PropagationClustering(**graph_clustering_kwargs)
@@ -848,11 +864,12 @@ class GraphArchetypeEncoder(BaseEstimator, TransformerMixin):
         
         membership_row_, membership_col_ = self._get_graph_clusterer(graph_cluster_method=self.graph_cluster_method,
                                                  leaf_biadjacency_matrix=X,
-                                                 n_archetypes=self.n_archetypes,
+                                                 n_archetypes=self.max_archetypes,
                                                  beta=self.beta,
                                                  **self.graph_clustering_kwargs
                                                 )
-        #   
+        #
+                            
         if self.fuzzy_membership:
             #gets the membership as the aerage of the point membership that falls into that leaf
             leaf_memberships = sparse_dot_product(X.T,
